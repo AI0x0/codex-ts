@@ -10,8 +10,11 @@ export const UPDATE_PLAN_TOOL_NAME = "update_plan";
 export function createUpdatePlanTool(): ToolSpec {
   const planItemSchema = S.object(
     {
-      step: S.string(),
-      status: S.string("One of: pending, in_progress, completed"),
+      step: S.string("Task step text."),
+      status: S.stringEnum(
+        ["pending", "in_progress", "completed"],
+        "Step status.",
+      ),
     },
     ["step", "status"],
     false,
@@ -26,7 +29,7 @@ Provide an optional explanation and a list of plan items, each with a step and s
 At most one step can be in_progress at a time.`,
       parameters: S.object(
         {
-          explanation: S.string(),
+          explanation: S.string("Optional explanation for this plan update."),
           plan: S.array(planItemSchema, "The list of steps"),
         },
         ["plan"],

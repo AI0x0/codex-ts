@@ -2,7 +2,7 @@
 
 轻量级 TypeScript agent harness，完全照搬 [openai/codex](https://github.com/openai/codex) Rust 实现（`codex-rs`）的架构设计，可在**浏览器**和 **Node.js** 中直接运行，无任何原生依赖。
 
-本仓库 fork 自 [`openai/codex@cca1e0ba`](https://github.com/openai/codex/commit/cca1e0ba1)，新增代码全部在 `codex-ts/` 目录，不修改上游文件。
+本仓库 fork 自 [`openai/codex@6bcccb0e`](https://github.com/openai/codex/commit/6bcccb0ee)，新增代码全部在 `codex-ts/` 目录，不修改上游文件。
 
 ---
 
@@ -489,14 +489,14 @@ codex-ts/
 
 `codex-ts/` 的所有实现均对照 codex-rs 在以下提交时的源码逐一照搬：
 
-**[`cca1e0ba`](https://github.com/openai/codex/commit/cca1e0ba1) — Uprev Rust toolchain pins to 1.95.0**
+**[`6bcccb0e`](https://github.com/openai/codex/commit/6bcccb0ee) — cli: add package path from install context (#26189)**
 
 以后同步上游时，以这个哈希为起点与新版本做 diff，确认哪些 Rust 侧变更需要同步到 codex-ts 的对应 `.ts` 文件：
 
 ```bash
 # 查看上游在参照提交之后的变更
-git diff cca1e0ba HEAD -- codex-rs/protocol/src/protocol.rs
-git diff cca1e0ba HEAD -- codex-rs/ext/goal/src/spec.rs
+git diff 6bcccb0e HEAD -- codex-rs/protocol/src/protocol.rs
+git diff 6bcccb0e HEAD -- codex-rs/ext/goal/src/spec.rs
 # 依此类推对照上方映射表逐文件检查
 ```
 
