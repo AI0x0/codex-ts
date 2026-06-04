@@ -3,6 +3,35 @@
   "version": "0.1.0",
   "type": "module",
   "license": "Apache-2.0",
+  "exports": {
+    ".": {
+      "import": "./dist/core/src/index.js",
+      "types": "./dist/core/src/index.d.ts"
+    },
+    "./protocol": {
+      "import": "./dist/protocol/src/index.js",
+      "types": "./dist/protocol/src/index.d.ts"
+    },
+    "./tools": {
+      "import": "./dist/tools/src/index.js",
+      "types": "./dist/tools/src/index.d.ts"
+    },
+    "./ext/goal": {
+      "import": "./dist/ext/goal/src/index.js",
+      "types": "./dist/ext/goal/src/index.d.ts"
+    },
+    "./thread-store": {
+      "import": "./dist/thread-store/src/index.js",
+      "types": "./dist/thread-store/src/index.d.ts"
+    },
+    "./state": {
+      "import": "./dist/state/src/index.js",
+      "types": "./dist/state/src/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
