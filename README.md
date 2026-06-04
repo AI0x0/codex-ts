@@ -78,9 +78,9 @@ Submit an operation; returns `submission_id`. Mirrors `pub async fn submit(&self
 
 | `op.type` | Description |
 |---|---|
-| `UserInput` | Send a user message, starts a new turn |
+| `UserInput` | Send a user message, starts a new turn. Optional `model` and `instructions` fields override the thread-level defaults for this turn only |
 | `UserInputAnswer` | Answer a `request_user_input` call; `id` = `RequestUserInputEvent.turn_id` |
-| `Interrupt` | Abort the current turn |
+| `Interrupt` | Abort the in-flight turn (cancels the pending `fetch` via `AbortController`) |
 
 #### `nextEvent(): Promise<Event>`
 
@@ -270,7 +270,22 @@ const fsBackend: IoBackend = {
 const thread = new CodexThread({ apiKey, model, ioBackend: fsBackend });
 ```
 
-### Browser (OPFS)
+### Browser (IndexedDB — built-in)
+
+`IndexedDBIoBackend` is included and requires no configuration:
+
+```ts
+import { CodexThread, IndexedDBIoBackend } from "@ai0x0/codex-ts";
+
+const thread = new CodexThread({
+  apiKey, model,
+  ioBackend: new IndexedDBIoBackend(), // persists to IndexedDB automatically
+});
+```
+
+### Browser (OPFS — manual)
+
+If you prefer OPFS (Origin Private File System) for higher throughput:
 
 ```ts
 const opfsBackend: IoBackend = {
@@ -408,26 +423,46 @@ export function Chat() {
 
 ## Adding a custom tool
 
-Add a `case` in `core/src/tools/router.ts` and return the schema from `toolSpecs()`:
+Implement the `CustomTool` interface and pass it to `CodexThread`. No need to
+touch `router.ts` — the tool is injected at construction time.
 
 ```ts
-// In toolSpecs()
-{
-  type: "function",
-  tool: {
-    name: "my_tool",
-    description: "...",
-    parameters: S.object({ query: S.string("Search query") }, ["query"], false),
-    strict: false,
-  },
-}
+import { CodexThread } from "@ai0x0/codex-ts";
+import type { CustomTool, CustomToolContext } from "@ai0x0/codex-ts";
+import * as S from "@ai0x0/codex-ts/tools";
 
-// In dispatch()
-case "my_tool": {
-  const result = await myHandler(args["query"] as string);
-  return JSON.stringify(result);
-}
+const searchTool: CustomTool = {
+  name: "web_search",
+  spec() {
+    return {
+      type: "function",
+      tool: {
+        name: "web_search",
+        description: "Search the web.",
+        parameters: S.object({ query: S.string("Search query") }, ["query"], false),
+        strict: false,
+      },
+    };
+  },
+  async execute(args: unknown, ctx: CustomToolContext) {
+    const { query } = args as { query: string };
+    const results = await mySearchAPI(query);
+    return JSON.stringify(results);
+  },
+};
+
+const thread = new CodexThread({
+  apiKey: "sk-...",
+  model: "gpt-4o",
+  customTools: [searchTool],
+});
 ```
+
+`CustomToolContext` exposes `callId`, `turnId`, and `emitEvent` for tools that
+need to emit side-effect events (e.g. streaming progress) before returning.
+
+For project-internal tools that should be part of the built-in set, add a `case`
+in `core/src/tools/router.ts` instead (same pattern as `update_plan`).
 
 ---
 
@@ -457,7 +492,8 @@ codex-ts/
 │   ├── in_memory.ts                 ←   in_memory.rs       (InMemoryThreadStore)
 │   ├── live_thread.ts               ←   live_thread.rs     (LiveThread)
 │   ├── local_thread_store.ts        ←   local/             (IoBackend → ThreadStore)
-│   └── io_backend.ts                ←   [new]              (injectable IoBackend)
+│   ├── io_backend.ts                ←   [browser ext]      (injectable IoBackend interface)
+│   └── indexeddb.ts                 ←   [browser ext]      (IndexedDB implementation)
 │
 ├── state/src/runtime/               ← codex-rs/state/src/runtime/
 │   └── goals.ts                     ←   goals.rs           (GoalStore + GoalBackend)
@@ -479,7 +515,8 @@ codex-ts/
             ├── goal.test.ts                    ←   tool_harness.rs (goal)
             ├── plan.test.ts                    ←   tool_harness.rs (plan)
             ├── request_user_input.test.ts      ←   request_user_input.rs
-            └── resume.test.ts                  ←   resume.rs
+            ├── resume.test.ts                  ←   resume.rs
+            └── extensions.test.ts              ←   [browser ext]  (CustomTool, Interrupt)
 ```
 
 ---

@@ -76,9 +76,9 @@ const thread = new CodexThread({
 
 | `op.type` | 说明 |
 |---|---|
-| `UserInput` | 发送用户消息，触发新一轮 |
+| `UserInput` | 发送用户消息，触发新一轮。可选 `model` / `instructions` 字段覆盖本轮的线程级默认值 |
 | `UserInputAnswer` | 回答 `request_user_input`，`id` = `RequestUserInputEvent.turn_id` |
-| `Interrupt` | 中断当前轮次 |
+| `Interrupt` | 中断当前正在执行的轮次（通过 `AbortController` 取消挂起的 `fetch`） |
 
 #### `nextEvent(): Promise<Event>`
 
@@ -260,7 +260,22 @@ const fsBackend: IoBackend = {
 const thread = new CodexThread({ apiKey, model, ioBackend: fsBackend });
 ```
 
-### 浏览器（OPFS）
+### 浏览器（IndexedDB — 内置）
+
+`IndexedDBIoBackend` 已内置，开箱即用：
+
+```ts
+import { CodexThread, IndexedDBIoBackend } from "@ai0x0/codex-ts";
+
+const thread = new CodexThread({
+  apiKey, model,
+  ioBackend: new IndexedDBIoBackend(), // 自动持久化到 IndexedDB
+});
+```
+
+### 浏览器（OPFS — 手动实现）
+
+如需更高吞吐量，可自行实现 OPFS 版本：
 
 ```ts
 const opfsBackend: IoBackend = {
@@ -406,26 +421,43 @@ export function Chat() {
 
 ## 自定义扩展工具
 
-在 `core/src/tools/router.ts` 的 `dispatch` 中加一个 `case`，在 `toolSpecs()` 中返回对应 JSON schema：
+实现 `CustomTool` 接口，在构造 `CodexThread` 时注入，无需修改 `router.ts`：
 
 ```ts
-// toolSpecs() 中加入 schema
-{
-  type: "function",
-  tool: {
-    name: "my_tool",
-    description: "...",
-    parameters: S.object({ query: S.string("搜索词") }, ["query"], false),
-    strict: false,
-  },
-}
+import { CodexThread } from "@ai0x0/codex-ts";
+import type { CustomTool, CustomToolContext } from "@ai0x0/codex-ts";
+import * as S from "@ai0x0/codex-ts/tools";
 
-// dispatch 中加入处理
-case "my_tool": {
-  const result = await myHandler(args["query"] as string);
-  return JSON.stringify(result);
-}
+const searchTool: CustomTool = {
+  name: "web_search",
+  spec() {
+    return {
+      type: "function",
+      tool: {
+        name: "web_search",
+        description: "搜索网络。",
+        parameters: S.object({ query: S.string("搜索词") }, ["query"], false),
+        strict: false,
+      },
+    };
+  },
+  async execute(args: unknown, ctx: CustomToolContext) {
+    const { query } = args as { query: string };
+    const results = await mySearchAPI(query);
+    return JSON.stringify(results);
+  },
+};
+
+const thread = new CodexThread({
+  apiKey: "sk-...",
+  model: "gpt-4o",
+  customTools: [searchTool],
+});
 ```
+
+`CustomToolContext` 提供 `callId`、`turnId` 和 `emitEvent`，供需要发送中间事件的工具使用。
+
+如果工具是项目内置的，也可以直接在 `core/src/tools/router.ts` 的 `dispatch` 加 `case`（参考 `update_plan` 的写法）。
 
 ---
 
@@ -454,7 +486,8 @@ codex-ts/
 │   ├── in_memory.ts                 ←   in_memory.rs       (InMemoryThreadStore)
 │   ├── live_thread.ts               ←   live_thread.rs     (LiveThread)
 │   ├── local_thread_store.ts        ←   local/             (IoBackend → ThreadStore)
-│   └── io_backend.ts                ←   [新增]             (IoBackend 可注入接口)
+│   ├── io_backend.ts                ←   [浏览器扩展]       (IoBackend 可注入接口)
+│   └── indexeddb.ts                 ←   [浏览器扩展]       (IndexedDB 内置实现)
 │
 ├── state/src/runtime/               ← codex-rs/state/src/runtime/
 │   └── goals.ts                     ←   goals.rs           (GoalStore + GoalBackend)
@@ -476,7 +509,8 @@ codex-ts/
             ├── goal.test.ts                    ←   tool_harness.rs (goal 部分)
             ├── plan.test.ts                    ←   tool_harness.rs (plan 部分)
             ├── request_user_input.test.ts      ←   request_user_input.rs
-            └── resume.test.ts                  ←   resume.rs
+            ├── resume.test.ts                  ←   resume.rs
+            └── extensions.test.ts              ←   [浏览器扩展]  (CustomTool, Interrupt)
 ```
 
 ---
