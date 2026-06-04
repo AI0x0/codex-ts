@@ -485,18 +485,34 @@ codex-ts/
 
 本仓库仅新增 `codex-ts/` 目录，对上游文件的唯一改动是 `pnpm-workspace.yaml` 追加一行 `- codex-ts`。
 
-当前基于上游提交：[`cca1e0ba`](https://github.com/openai/codex/commit/cca1e0ba1)（Uprev Rust toolchain pins to 1.95.0）
+### codex-ts 参照版本
+
+`codex-ts/` 的所有实现均对照 codex-rs 在以下提交时的源码逐一照搬：
+
+**[`cca1e0ba`](https://github.com/openai/codex/commit/cca1e0ba1) — Uprev Rust toolchain pins to 1.95.0**
+
+以后同步上游时，以这个哈希为起点与新版本做 diff，确认哪些 Rust 侧变更需要同步到 codex-ts 的对应 `.ts` 文件：
 
 ```bash
-# 添加上游源
+# 查看上游在参照提交之后的变更
+git diff cca1e0ba HEAD -- codex-rs/protocol/src/protocol.rs
+git diff cca1e0ba HEAD -- codex-rs/ext/goal/src/spec.rs
+# 依此类推对照上方映射表逐文件检查
+```
+
+同步完成后将上方哈希替换为新的参照提交。
+
+### 同步流程
+
+```bash
+# 添加上游源（仅首次）
 git remote add upstream git@github.com:openai/codex.git
 
-# 拉取上游最新代码并 rebase
+# 拉取并 rebase
 git fetch upstream
 git rebase upstream/main
 
 # 如有冲突，仅 pnpm-workspace.yaml 需手动保留 codex-ts 这一行
-# 同步完成后更新自述里的基准提交哈希
 ```
 
 当上游 `codex-rs` 有变更时，按对应关系更新 `codex-ts` 的镜像文件：
