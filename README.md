@@ -2,7 +2,7 @@
 
 轻量级 TypeScript agent harness，完全照搬 [openai/codex](https://github.com/openai/codex) Rust 实现（`codex-rs`）的架构设计，可在**浏览器**和 **Node.js** 中直接运行，无任何原生依赖。
 
-本仓库 fork 自 `openai/codex`，新增代码全部在 `codex-ts/` 目录，不修改上游文件。
+本仓库 fork 自 [`openai/codex@cca1e0ba`](https://github.com/openai/codex/commit/cca1e0ba1)，新增代码全部在 `codex-ts/` 目录，不修改上游文件。
 
 ---
 
@@ -485,11 +485,18 @@ codex-ts/
 
 本仓库仅新增 `codex-ts/` 目录，对上游文件的唯一改动是 `pnpm-workspace.yaml` 追加一行 `- codex-ts`。
 
+当前基于上游提交：[`cca1e0ba`](https://github.com/openai/codex/commit/cca1e0ba1)（Uprev Rust toolchain pins to 1.95.0）
+
 ```bash
-# 拉取上游最新代码
-git pull origin main
+# 添加上游源
+git remote add upstream git@github.com:openai/codex.git
+
+# 拉取上游最新代码并 rebase
+git fetch upstream
+git rebase upstream/main
 
 # 如有冲突，仅 pnpm-workspace.yaml 需手动保留 codex-ts 这一行
+# 同步完成后更新自述里的基准提交哈希
 ```
 
 当上游 `codex-rs` 有变更时，按对应关系更新 `codex-ts` 的镜像文件：
