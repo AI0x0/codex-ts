@@ -73,6 +73,7 @@ const thread = new CodexThread({
   baseInstructions?: string;  // 在 instructions 之前注入；默认 DEFAULT_BASE_INSTRUCTIONS；传 "" 可禁用
   skills?: SkillMetadata[];   // 已发现的技能列表，用于生成常驻目录（Layer 1）
   loadSkillContent?: (skill: SkillMetadata) => Promise<string>; // 按需加载 SKILL.md 全文（Layer 2）
+  agentsMd?: string;           // AGENTS.md 内容，通过 "--- project-doc ---" 分隔符合并入指令
   autoCompactTokenLimit?: number;  // 内联自动压缩的 token 阈值（推荐：context_window × 0.9）
 });
 ```
@@ -520,6 +521,23 @@ await thread.submit({
   items: [{ type: "text", text: "用 $song-analyzer 分析这首曲子" }],
 });
 ```
+
+### AGENTS.md（项目文档注入）
+
+照搬 `codex-rs/core/src/agents_md.rs`。将项目 `AGENTS.md` 的内容通过 `agentsMd` 字段传入，codex-ts 会使用 `--- project-doc ---` 分隔符（codex-rs `AGENTS_MD_SEPARATOR`）将其合并到开发者指令之后。文件读取和选择（例如优先使用 `AGENTS.override.md`）由 host 负责。
+
+```ts
+const thread = new CodexThread({
+  apiKey, model,
+  instructions: "你是一个助手。",
+  // 项目 AGENTS.md 的内容
+  agentsMd: `## 项目背景\n这是一个音乐平台...`,
+});
+// 发送给模型的有效指令：
+//   "你是一个助手。\n\n--- project-doc ---\n\n## 项目背景\n..."
+```
+
+当只传 `agentsMd` 不传 `instructions` 时，内容直接出现，不会有多余的分隔符前缀；未提供 `agentsMd` 时，分隔符从不出现。
 
 ---
 

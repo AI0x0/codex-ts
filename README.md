@@ -75,6 +75,7 @@ const thread = new CodexThread({
   baseInstructions?: string;  // prepended before instructions; defaults to DEFAULT_BASE_INSTRUCTIONS; pass "" to disable
   skills?: SkillMetadata[];   // discovered skills for the always-on catalog (Layer 1)
   loadSkillContent?: (skill: SkillMetadata) => Promise<string>; // full-body loader for $mention injection (Layer 2)
+  agentsMd?: string;           // AGENTS.md content merged into instructions via "--- project-doc ---" separator
   autoCompactTokenLimit?: number;  // token threshold for inline auto-compaction (e.g. context_window × 0.9)
 });
 ```
@@ -522,6 +523,23 @@ await thread.submit({
   items: [{ type: "text", text: "use $song-analyzer on this track" }],
 });
 ```
+
+### AGENTS.md (project documentation)
+
+Mirrors `codex-rs/core/src/agents_md.rs`. Pass the content of your project's `AGENTS.md` as `agentsMd`; it is merged into the developer instructions using the `--- project-doc ---` separator (codex-rs `AGENTS_MD_SEPARATOR`). Reading and selecting the file (e.g. preferring `AGENTS.override.md`) is the host's responsibility — the browser has no filesystem.
+
+```ts
+const thread = new CodexThread({
+  apiKey, model,
+  instructions: "You are a helpful assistant.",
+  // Content of your project's AGENTS.md
+  agentsMd: `## Project context\nThis is a music platform...`,
+});
+// Effective instructions sent to the model:
+//   "You are a helpful assistant.\n\n--- project-doc ---\n\n## Project context\n..."
+```
+
+When `agentsMd` is provided without `instructions`, the project doc appears alone (no orphaned separator). When `agentsMd` is absent, the separator is never injected.
 
 ---
 

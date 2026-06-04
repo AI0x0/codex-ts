@@ -256,3 +256,108 @@ describe("catalog budget (mirrors render.rs)", () => {
     expect(out).not.toContain("not included in the model-visible skills list.");
   });
 });
+
+describe("AGENTS.md injection (mirrors AgentsMdManager)", () => {
+  /**
+   * Mirrors agents_md_tests.rs — the separator is "\n\n--- project-doc ---\n\n"
+   * (codex-rs AGENTS_MD_SEPARATOR const in agents_md.rs:42).
+   * When agentsMd is absent the separator must NOT appear in the instructions.
+   */
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("merges agentsMd into instructions with the project-doc separator", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      makeSseResponse(
+        sseFlat([
+          evResponseCreated("r1"),
+          evAssistantMessage("ok"),
+          evCompleted("r1"),
+        ]),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const codex = new CodexThread({
+      apiKey: "k",
+      model: "m",
+      instructions: "DEV_INSTRUCTIONS",
+      agentsMd: "PROJECT_DOC_BODY",
+    });
+    await codex.submit({
+      type: "UserInput",
+      items: [{ type: "text", text: "hi" }],
+    });
+    await waitForEvent(codex, (m) => m.type === "TurnComplete");
+
+    const init = fetchMock.mock.calls[0]![1] as RequestInit;
+    const body = JSON.parse(init.body as string) as { instructions: string };
+    expect(body.instructions).toContain("DEV_INSTRUCTIONS");
+    expect(body.instructions).toContain("--- project-doc ---");
+    expect(body.instructions).toContain("PROJECT_DOC_BODY");
+  });
+
+  it("uses agentsMd alone (no instructions) without a leading separator", async () => {
+    // mirrors agents_md_tests.rs: no user_instructions + doc → just the doc
+    const fetchMock = vi.fn().mockResolvedValue(
+      makeSseResponse(
+        sseFlat([
+          evResponseCreated("r1"),
+          evAssistantMessage("ok"),
+          evCompleted("r1"),
+        ]),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const codex = new CodexThread({
+      apiKey: "k",
+      model: "m",
+      baseInstructions: "",   // suppress default so only agentsMd appears
+      agentsMd: "ONLY_PROJECT_DOC",
+    });
+    await codex.submit({
+      type: "UserInput",
+      items: [{ type: "text", text: "hi" }],
+    });
+    await waitForEvent(codex, (m) => m.type === "TurnComplete");
+
+    const init = fetchMock.mock.calls[0]![1] as RequestInit;
+    const body = JSON.parse(init.body as string) as { instructions: string };
+    expect(body.instructions).toContain("ONLY_PROJECT_DOC");
+    // No orphaned separator at the start
+    expect(body.instructions).not.toMatch(/^--- project-doc ---/);
+  });
+
+  it("omits the separator entirely when no agentsMd is provided", async () => {
+    // mirrors agents_md_tests.rs: instructions + no doc → no separator
+    const fetchMock = vi.fn().mockResolvedValue(
+      makeSseResponse(
+        sseFlat([
+          evResponseCreated("r1"),
+          evAssistantMessage("ok"),
+          evCompleted("r1"),
+        ]),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const codex = new CodexThread({
+      apiKey: "k",
+      model: "m",
+      instructions: "DEV_INSTRUCTIONS",
+      // no agentsMd
+    });
+    await codex.submit({
+      type: "UserInput",
+      items: [{ type: "text", text: "hi" }],
+    });
+    await waitForEvent(codex, (m) => m.type === "TurnComplete");
+
+    const init = fetchMock.mock.calls[0]![1] as RequestInit;
+    const body = JSON.parse(init.body as string) as { instructions: string };
+    expect(body.instructions).toContain("DEV_INSTRUCTIONS");
+    expect(body.instructions).not.toContain("--- project-doc ---");
+  });
+});

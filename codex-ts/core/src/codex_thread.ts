@@ -128,6 +128,13 @@ export interface CodexThreadConfig {
   /** Reads a skill's full SKILL.md on demand (host-provided; browser has no fs). */
   loadSkillContent?: ((skill: SkillMetadata) => Promise<string>) | undefined;
   /**
+   * Project documentation (AGENTS.md content), merged into the developer
+   * instructions with codex-rs's `--- project-doc ---` separator. Mirrors
+   * codex-rs's AgentsMdManager; discovery (finding AGENTS.override.md / AGENTS.md)
+   * is the host's job since a browser has no filesystem.
+   */
+  agentsMd?: string | undefined;
+  /**
    * Input-token threshold for inline auto-compaction (BodyAfterPrefix mode).
    * mirrors model_auto_compact_token_limit in codex-rs TurnContext config.
    *
@@ -145,6 +152,7 @@ interface ResolvedConfig {
   baseInstructions: string;
   skills: SkillMetadata[];
   loadSkillContent?: ((skill: SkillMetadata) => Promise<string>) | undefined;
+  agentsMd?: string | undefined;
   autoCompactTokenLimit?: number | undefined;
 }
 
@@ -184,6 +192,7 @@ export class CodexThread {
       baseInstructions: config.baseInstructions ?? DEFAULT_BASE_INSTRUCTIONS,
       skills: config.skills ?? [],
       loadSkillContent: config.loadSkillContent,
+      agentsMd: config.agentsMd,
       autoCompactTokenLimit: config.autoCompactTokenLimit,
     };
 
@@ -240,11 +249,17 @@ export class CodexThread {
         // Per-turn overrides (op.*) take precedence over thread-level config.
         // Developer instructions are layered on top of the base agent harness.
         const devInstructions = op.instructions ?? this.config.instructions;
+        // mirrors agents_md.rs AGENTS_MD_SEPARATOR = "\n\n--- project-doc ---\n\n"
+        // and AgentsMdManager::user_instructions() which concatenates dev instructions
+        // with the project doc using that separator.
+        const devWithProjectDoc = [devInstructions, this.config.agentsMd]
+          .filter((part): part is string => Boolean(part))
+          .join("\n\n--- project-doc ---\n\n");
         // Layer 1: the always-on skills catalog rides at the end of instructions.
         const skillsCatalog = renderSkillsCatalog(this.config.skills);
         const instructions = [
           this.config.baseInstructions,
-          devInstructions,
+          devWithProjectDoc,
           skillsCatalog,
         ]
           .filter((part): part is string => Boolean(part))
