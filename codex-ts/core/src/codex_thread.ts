@@ -127,6 +127,14 @@ export interface CodexThreadConfig {
   skills?: SkillMetadata[] | undefined;
   /** Reads a skill's full SKILL.md on demand (host-provided; browser has no fs). */
   loadSkillContent?: ((skill: SkillMetadata) => Promise<string>) | undefined;
+  /**
+   * Input-token threshold for inline auto-compaction (BodyAfterPrefix mode).
+   * mirrors model_auto_compact_token_limit in codex-rs TurnContext config.
+   *
+   * Recommended: context_window × 0.9  (e.g. 115 000 for gpt-4o's 128 k window).
+   * Omit to disable auto-compaction entirely.
+   */
+  autoCompactTokenLimit?: number | undefined;
 }
 
 interface ResolvedConfig {
@@ -137,6 +145,7 @@ interface ResolvedConfig {
   baseInstructions: string;
   skills: SkillMetadata[];
   loadSkillContent?: ((skill: SkillMetadata) => Promise<string>) | undefined;
+  autoCompactTokenLimit?: number | undefined;
 }
 
 // ─── CodexThread ─────────────────────────────────────────────────────────────
@@ -175,6 +184,7 @@ export class CodexThread {
       baseInstructions: config.baseInstructions ?? DEFAULT_BASE_INSTRUCTIONS,
       skills: config.skills ?? [],
       loadSkillContent: config.loadSkillContent,
+      autoCompactTokenLimit: config.autoCompactTokenLimit,
     };
 
     this.threadId = config.threadId ?? nextId();
@@ -249,6 +259,9 @@ export class CodexThread {
             : {}),
           ...(this.config.loadSkillContent
             ? { loadSkillContent: this.config.loadSkillContent }
+            : {}),
+          ...(this.config.autoCompactTokenLimit !== undefined
+            ? { autoCompactTokenLimit: this.config.autoCompactTokenLimit }
             : {}),
         };
 

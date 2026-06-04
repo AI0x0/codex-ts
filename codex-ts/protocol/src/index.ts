@@ -8,6 +8,7 @@ export type {
   RequestUserInputEvent,
 } from "./request_user_input.js";
 export type { StepStatus, PlanItemArg, UpdatePlanArgs } from "./plan_tool.js";
+export type { ContextCompactedEvent, WarningEvent } from "./protocol.js";
 export type {
   ThreadGoalStatus,
   ThreadGoal,

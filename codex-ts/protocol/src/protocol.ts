@@ -70,6 +70,14 @@ export interface ErrorEvent {
 
 // ─── EventMsg ─────────────────────────────────────────────────────────────────
 
+/** mirrors codex-rs/protocol/src/protocol.rs ContextCompactedEvent (unit struct) */
+export type ContextCompactedEvent = Record<never, never>;
+
+/** mirrors WarningEvent */
+export interface WarningEvent {
+  message: string;
+}
+
 export type EventMsg =
   | { type: "TurnStarted"; event: TurnStartedEvent }
   | { type: "TurnComplete"; event: TurnCompleteEvent }
@@ -78,6 +86,10 @@ export type EventMsg =
   | { type: "RequestUserInput"; event: RequestUserInputEvent }
   | { type: "ThreadGoalUpdated"; event: ThreadGoalUpdatedEvent }
   | { type: "PlanUpdate"; event: UpdatePlanArgs }
+  /** mirrors EventMsg::ContextCompacted — emitted when inline compaction runs */
+  | { type: "ContextCompacted"; event: ContextCompactedEvent }
+  /** mirrors EventMsg::Warning — post-compaction advisory */
+  | { type: "Warning"; event: WarningEvent }
   | { type: "Error"; event: ErrorEvent };
 
 /** Wraps EventMsg with the submission_id that originated it — mirrors codex-rs Event */

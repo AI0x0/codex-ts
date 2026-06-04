@@ -19,50 +19,13 @@ import type { SkillMetadata } from "../skills.js";
 import type { PendingInputs } from "../tools/handlers/request_user_input.js";
 import type { LiveThread } from "../../../thread-store/src/live_thread.js";
 import type { ConversationItem } from "../../../thread-store/src/types.js";
+import { parseSseStream } from "./sse.js";
+import { runInlineAutoCompactTask } from "../compact.js";
+import { AutoCompactWindow } from "../state/auto_compact_window.js";
 
 // ConversationItem from thread-store is the canonical type for both
 // history sent to the API and items persisted to the store.
 type HistoryItem = ConversationItem;
-
-// ─── Raw SSE event from the Responses API ────────────────────────────────────
-
-type RawSseEvent = Record<string, unknown>;
-
-// ─── SSE stream parser ────────────────────────────────────────────────────────
-
-async function* parseSseStream(
-  body: ReadableStream<Uint8Array>,
-): AsyncGenerator<RawSseEvent> {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      let dataLine = "";
-      for (const line of lines) {
-        if (line.startsWith("data: ")) {
-          dataLine = line.slice(6).trim();
-        } else if (line === "" && dataLine) {
-          if (dataLine !== "[DONE]") {
-            try {
-              yield JSON.parse(dataLine) as RawSseEvent;
-            } catch {
-              /* malformed JSON — skip */
-            }
-          }
-          dataLine = "";
-        }
-      }
-    }
-  } finally {
-    reader.releaseLock();
-  }
-}
 
 // ─── TurnConfig ──────────────────────────────────────────────────────────────
 
@@ -78,6 +41,16 @@ export interface TurnConfig {
    * has no filesystem (mirrors how IoBackend is injected).
    */
   loadSkillContent?: ((skill: SkillMetadata) => Promise<string>) | undefined;
+  /**
+   * Input-token threshold that triggers inline auto-compaction.
+   * mirrors model_auto_compact_token_limit in codex-rs TurnContext config.
+   *
+   * In BodyAfterPrefix mode (the default) this is compared against tokens
+   * added since the last compaction, not total context size.
+   * Typical value: context_window × 0.9.
+   * Omit to disable auto-compaction.
+   */
+  autoCompactTokenLimit?: number | undefined;
 }
 
 // ─── runTurn ─────────────────────────────────────────────────────────────────
@@ -142,6 +115,11 @@ export async function runTurn(
   let lastAgentMessage = "";
   let itemIdCounter = 0;
 
+  // ── Auto-compaction window tracker (mirrors AutoCompactWindow in codex-rs) ──
+  // Uses BodyAfterPrefix mode: only tokens added after the last compaction count
+  // toward the limit. mirrors AutoCompactTokenLimitScope::BodyAfterPrefix.
+  const compactWindow = new AutoCompactWindow();
+
   for (;;) {
     // Bail out before sampling again if the turn was interrupted.
     if (abortSignal?.aborted) {
@@ -182,6 +160,7 @@ export async function runTurn(
     const partialArgs = new Map<string, { name: string; args: string }>();
     let assistantText = "";
     let currentItemId = `item-${++itemIdCounter}`;
+    let inputTokensThisRound = 0;
 
     for await (const raw of parseSseStream(res.body)) {
       switch (raw["type"]) {
@@ -220,6 +199,16 @@ export async function runTurn(
           }
           break;
         }
+        case "response.done": {
+          // mirrors ensure_server_observed_prefill_from_usage in auto_compact_window.rs
+          const resp = raw["response"] as Record<string, unknown> | undefined;
+          const usage = resp?.["usage"] as Record<string, unknown> | undefined;
+          if (typeof usage?.["input_tokens"] === "number") {
+            inputTokensThisRound = usage["input_tokens"];
+            compactWindow.ensureServerObservedPrefill(inputTokensThisRound);
+          }
+          break;
+        }
       }
     }
 
@@ -246,6 +235,27 @@ export async function runTurn(
 
     // ── Done when no tool calls ─────────────────────────────────────────────
     if (functionCalls.length === 0) break;
+
+    // ── Auto-compaction check (mirrors post-sampling compact in turn.rs) ─────
+    // Only triggered mid-turn (when there are more tool calls to dispatch),
+    // matching InitialContextInjection::BeforeLastUserMessage behaviour.
+    if (config.autoCompactTokenLimit !== undefined && inputTokensThisRound > 0) {
+      const scopeTokens = compactWindow.bodyAfterPrefix(inputTokensThisRound);
+      const limitReached = scopeTokens >= config.autoCompactTokenLimit;
+      if (limitReached) {
+        emitEvent({ type: "ContextCompacted", event: {} });
+        await runInlineAutoCompactTask(history, config);
+        compactWindow.startNext();
+        emitEvent({
+          type: "Warning",
+          event: {
+            message:
+              "Heads up: Long threads and multiple compactions can cause the model to be less accurate. " +
+              "Start a new thread when possible to keep threads small and targeted.",
+          },
+        });
+      }
+    }
 
     // ── Dispatch tool calls ─────────────────────────────────────────────────
     for (const call of functionCalls) {

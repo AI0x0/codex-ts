@@ -1,4 +1,6 @@
 export { CodexThread } from "./codex_thread.js";
+export { SUMMARIZATION_PROMPT, SUMMARY_PREFIX } from "./compact.js";
+export { AutoCompactWindow } from "./state/auto_compact_window.js";
 export type { CodexThreadConfig } from "./codex_thread.js";
 export { DEFAULT_BASE_INSTRUCTIONS } from "./base_instructions.js";
 export {
