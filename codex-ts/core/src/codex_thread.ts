@@ -27,6 +27,7 @@ import {
 import type { ThreadStore, IoBackend } from "../../thread-store/src/index.js";
 import type { ConversationItem } from "../../thread-store/src/types.js";
 import { ToolRouter } from "./tools/router.js";
+import type { CustomTool } from "./tools/router.js";
 import { runTurn } from "./session/turn.js";
 import type { TurnConfig } from "./session/turn.js";
 import type { PendingInputs } from "./tools/handlers/request_user_input.js";
@@ -101,6 +102,11 @@ export interface CodexThreadConfig {
    * Pass a GoalStore with a custom GoalBackend for persistence.
    */
   goalStore?: GoalStore | undefined;
+  /**
+   * Host-supplied custom tools. Their specs are advertised to the model
+   * alongside the built-ins, and calls route to each tool's execute().
+   */
+  customTools?: CustomTool[] | undefined;
 }
 
 interface ResolvedConfig {
@@ -130,6 +136,13 @@ export class CodexThread {
   private readonly router: ToolRouter;
   private readonly liveThread: LiveThread;
 
+  /**
+   * AbortController for the in-flight turn, if any.
+   * mirrors: codex-rs uses a tokio CancellationToken propagated from
+   * Op::Interrupt; AbortController is the browser-native equivalent.
+   */
+  private currentTurnAbort: AbortController | null = null;
+
   constructor(config: CodexThreadConfig) {
     this.config = {
       apiKey: config.apiKey,
@@ -153,7 +166,7 @@ export class CodexThread {
     const goalStore = config.goalStore ?? new GoalStore(new InMemoryGoalBackend());
     this.goalExecutor = new GoalToolExecutor(this.threadId, goalStore);
 
-    this.router = new ToolRouter(this.goalExecutor);
+    this.router = new ToolRouter(this.goalExecutor, config.customTools);
   }
 
   /** The thread's stable identifier (use for resume) */
@@ -188,14 +201,17 @@ export class CodexThread {
     switch (op.type) {
       case "UserInput": {
         const turnId = submissionId;
+        // Per-turn overrides (op.*) take precedence over thread-level config.
+        const instructions = op.instructions ?? this.config.instructions;
         const turnConfig: TurnConfig = {
           apiKey: this.config.apiKey,
           baseUrl: this.config.baseUrl,
-          model: this.config.model,
-          ...(this.config.instructions !== undefined
-            ? { instructions: this.config.instructions }
-            : {}),
+          model: op.model ?? this.config.model,
+          ...(instructions !== undefined ? { instructions } : {}),
         };
+
+        const abortController = new AbortController();
+        this.currentTurnAbort = abortController;
 
         this.pushEvent(submissionId, {
           type: "TurnStarted",
@@ -211,6 +227,7 @@ export class CodexThread {
           this.pendingInputs,
           (msg: EventMsg) => this.pushEvent(submissionId, msg),
           this.liveThread,        // ← persistence hook
+          abortController.signal, // ← interrupt hook
         )
           .then(({ lastAgentMessage }) => {
             this.pushEvent(submissionId, {
@@ -226,6 +243,11 @@ export class CodexThread {
               type: "Error",
               event: { message: String(err) },
             });
+          })
+          .finally(() => {
+            if (this.currentTurnAbort === abortController) {
+              this.currentTurnAbort = null;
+            }
           });
         break;
       }
@@ -240,6 +262,7 @@ export class CodexThread {
       }
 
       case "Interrupt":
+        this.currentTurnAbort?.abort();
         break;
     }
 

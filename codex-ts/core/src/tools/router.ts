@@ -40,12 +40,48 @@ export interface ToolRouterContext {
   emitEvent: (msg: EventMsg) => void;
 }
 
+// =============================================================================
+// Browser-specific extension — no direct equivalent in codex-rs.
+//
+// codex-rs registers tools via the `ToolExecutor<ToolInvocation>` trait and
+// the `CoreToolRuntime` marker; TypeScript has no traits, so we expose the
+// same concept as a plain interface that callers inject into CodexThread.
+// =============================================================================
+
+/**
+ * Context handed to a CustomTool's execute(). Carries the identifiers a host
+ * needs to correlate the call (callId / turnId) and an emitEvent escape hatch.
+ */
+export interface CustomToolContext {
+  callId: string;
+  turnId: string;
+  emitEvent: (msg: EventMsg) => void;
+}
+
+/**
+ * A host-supplied tool.
+ *
+ * TypeScript equivalent of implementing `ToolExecutor<ToolInvocation>` in
+ * codex-rs: the host provides the spec (advertised to the model) and an async
+ * execute() whose returned string becomes the function_call_output sent back.
+ */
+export interface CustomTool {
+  /** Tool name as advertised to and called by the model */
+  name: string;
+  /** ToolSpec included in Responses API requests */
+  spec(): ToolSpec;
+  /** Run the call; the returned string is fed back to the model as output */
+  execute(args: unknown, ctx: CustomToolContext): Promise<string>;
+}
+
 /** mirrors ToolRouter in router.rs */
 export class ToolRouter {
   private readonly goalExecutor: GoalToolExecutor;
+  private readonly customTools: Map<string, CustomTool>;
 
-  constructor(goalExecutor: GoalToolExecutor) {
+  constructor(goalExecutor: GoalToolExecutor, customTools: CustomTool[] = []) {
     this.goalExecutor = goalExecutor;
+    this.customTools = new Map(customTools.map((tool) => [tool.name, tool]));
   }
 
   /** All tool specs to include in Responses API requests */
@@ -56,6 +92,7 @@ export class ToolRouter {
       createUpdateGoalTool(),
       createRequestUserInputTool(),
       createUpdatePlanTool(),
+      ...Array.from(this.customTools.values(), (tool) => tool.spec()),
     ];
   }
 
@@ -128,8 +165,18 @@ export class ToolRouter {
         return "Plan updated";
       }
 
-      default:
+      default: {
+        const custom = this.customTools.get(toolName);
+        if (custom) {
+          // Hand the raw (un-normalised) args to the host; it does its own parsing.
+          return custom.execute(rawArgs, {
+            callId,
+            turnId: ctx.turnId,
+            emitEvent: ctx.emitEvent,
+          });
+        }
         return JSON.stringify({ error: `Unknown tool: ${toolName}` });
+      }
     }
   }
 }

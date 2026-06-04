@@ -83,8 +83,33 @@ export interface Event {
 
 // ─── Op ───────────────────────────────────────────────────────────────────────
 
+// =============================================================================
+// Browser-specific adaptation of Op::UserInput.
+//
+// codex-rs/protocol/src/protocol.rs carries a full `ThreadSettingsOverrides`
+// struct on UserInput (cwd, approval_policy, sandbox_policy, permission_profile,
+// collaboration_mode, …). These fields are native-only and meaningless in the
+// browser, so we expose only the two that are relevant: per-turn model and
+// per-turn instructions. Functionally equivalent to the subset of
+// ThreadSettingsOverrides::model and
+// ThreadSettingsOverrides::collaboration_mode.settings.developer_instructions.
+// =============================================================================
+
 export type Op =
-  | { type: "UserInput"; items: UserInput[] }
+  | {
+      type: "UserInput";
+      items: UserInput[];
+      /**
+       * Per-turn instructions override. Subset of ThreadSettingsOverrides in
+       * codex-rs. Falls back to the thread's instructions when omitted.
+       */
+      instructions?: string | undefined;
+      /**
+       * Per-turn model override. Subset of ThreadSettingsOverrides in codex-rs.
+       * Falls back to the thread's model when omitted.
+       */
+      model?: string | undefined;
+    }
   | {
       type: "UserInputAnswer";
       /** RequestUserInputEvent.turn_id — identifies which turn to unblock */

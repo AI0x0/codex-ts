@@ -14,6 +14,7 @@ export type {
 export type { ThreadStore } from "./store.js";
 export type { IoBackend } from "./io_backend.js";
 export { InMemoryIoBackend } from "./io_backend.js";
+export { IndexedDBIoBackend } from "./indexeddb.js";
 export { InMemoryThreadStore } from "./in_memory.js";
 export { LocalThreadStore } from "./local_thread_store.js";
 export { LiveThread } from "./live_thread.js";

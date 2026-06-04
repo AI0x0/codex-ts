@@ -88,6 +88,9 @@ export async function runTurn(
   pendingInputs: PendingInputs,
   emitEvent: (msg: EventMsg) => void,
   liveThread?: LiveThread | undefined,
+  /** mirrors: codex-rs propagates a tokio CancellationToken into the turn loop;
+   *  AbortSignal is the browser-native equivalent. */
+  abortSignal?: AbortSignal | undefined,
 ): Promise<{ lastAgentMessage: string }> {
   // Add user message to history (mutates the shared array)
   const userContent = userItems
@@ -106,6 +109,11 @@ export async function runTurn(
   let itemIdCounter = 0;
 
   for (;;) {
+    // Bail out before sampling again if the turn was interrupted.
+    if (abortSignal?.aborted) {
+      throw new DOMException("Turn interrupted", "AbortError");
+    }
+
     // ── Sample from the model ───────────────────────────────────────────────
     const body: Record<string, unknown> = {
       model: config.model,
@@ -122,6 +130,7 @@ export async function runTurn(
         Authorization: `Bearer ${config.apiKey}`,
       },
       body: JSON.stringify(body),
+      signal: abortSignal ?? null,
     });
 
     if (!res.ok || !res.body) {
