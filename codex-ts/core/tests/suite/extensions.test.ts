@@ -2,11 +2,13 @@
  * Tests for the host-extension features added on top of the codex-rs mirror:
  *   - custom tool registration (CodexThreadConfig.customTools)
  *   - Op.Interrupt aborting the in-flight turn
+ *   - baseInstructions layering (DEFAULT_BASE_INSTRUCTIONS + dev instructions)
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CodexThread } from "../../src/codex_thread.js";
+import { DEFAULT_BASE_INSTRUCTIONS } from "../../src/base_instructions.js";
 import type { CustomTool } from "../../src/tools/router.js";
 import {
   evAssistantMessage,
@@ -133,7 +135,9 @@ describe("custom tools", () => {
       instructions: string;
     };
     expect(body.model).toBe("turn-model");
-    expect(body.instructions).toBe("turn-instructions");
+    // instructions = base agent harness + per-turn developer instructions
+    expect(body.instructions).toContain("turn-instructions");
+    expect(body.instructions).toContain("autonomous agent");
   });
 });
 
@@ -171,5 +175,78 @@ describe("interrupt", () => {
 
     const err = await waitForEvent(codex, (m) => m.type === "Error");
     expect(err.type).toBe("Error");
+  });
+});
+
+// ─── baseInstructions layering ────────────────────────────────────────────────
+
+function makeSimpleResponse() {
+  return makeSseResponse(
+    sseFlat([evResponseCreated("r"), evAssistantMessage("ok"), evCompleted("r")]),
+  );
+}
+
+function capturedInstructions(fetchMock: ReturnType<typeof vi.fn>): string {
+  const init = fetchMock.mock.calls[0]![1] as RequestInit;
+  return (JSON.parse(init.body as string) as { instructions?: string }).instructions ?? "";
+}
+
+describe("baseInstructions layering", () => {
+  beforeEach(() => { vi.unstubAllGlobals(); });
+
+  it("prepends DEFAULT_BASE_INSTRUCTIONS when no baseInstructions is set", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeSimpleResponse());
+    vi.stubGlobal("fetch", fetchMock);
+
+    const codex = new CodexThread({
+      apiKey: "k", model: "m",
+      instructions: "dev instructions",
+    });
+    await codex.submit({ type: "UserInput", items: [{ type: "text", text: "hi" }] });
+    await waitForEvent(codex, (m) => m.type === "TurnComplete");
+
+    const instr = capturedInstructions(fetchMock);
+    expect(instr).toContain(DEFAULT_BASE_INSTRUCTIONS.slice(0, 40));
+    expect(instr).toContain("dev instructions");
+    // Base comes first
+    expect(instr.indexOf(DEFAULT_BASE_INSTRUCTIONS.slice(0, 20)))
+      .toBeLessThan(instr.indexOf("dev instructions"));
+  });
+
+  it("passing baseInstructions: '' disables the base harness", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeSimpleResponse());
+    vi.stubGlobal("fetch", fetchMock);
+
+    const codex = new CodexThread({
+      apiKey: "k", model: "m",
+      baseInstructions: "",
+      instructions: "only dev",
+    });
+    await codex.submit({ type: "UserInput", items: [{ type: "text", text: "hi" }] });
+    await waitForEvent(codex, (m) => m.type === "TurnComplete");
+
+    const instr = capturedInstructions(fetchMock);
+    expect(instr).toBe("only dev");
+  });
+
+  it("per-turn instructions override thread instructions but keep base", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeSimpleResponse());
+    vi.stubGlobal("fetch", fetchMock);
+
+    const codex = new CodexThread({
+      apiKey: "k", model: "m",
+      instructions: "thread-level",
+    });
+    await codex.submit({
+      type: "UserInput",
+      items: [{ type: "text", text: "hi" }],
+      instructions: "per-turn override",
+    });
+    await waitForEvent(codex, (m) => m.type === "TurnComplete");
+
+    const instr = capturedInstructions(fetchMock);
+    expect(instr).toContain("per-turn override");
+    expect(instr).not.toContain("thread-level");
+    expect(instr).toContain(DEFAULT_BASE_INSTRUCTIONS.slice(0, 20));
   });
 });

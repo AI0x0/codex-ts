@@ -60,6 +60,12 @@ export interface ThreadGoalUpdatedEvent {
 
 export interface ErrorEvent {
   message: string;
+  /**
+   * Browser-specific extension — no equivalent in codex-rs/protocol ErrorEvent.
+   * Lets hosts correlate an error with the turn that produced it (e.g. to
+   * suppress stale-turn errors after an Interrupt).
+   */
+  turn_id?: string | undefined;
 }
 
 // ─── EventMsg ─────────────────────────────────────────────────────────────────

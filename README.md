@@ -64,11 +64,15 @@ const thread = new CodexThread({
   apiKey: string;
   model: string;
   baseUrl?: string;          // default: https://api.openai.com/v1
-  instructions?: string;
+  instructions?: string;     // developer instructions (appended after base harness)
   threadId?: string;         // omit to generate; supply to resume
   threadStore?: ThreadStore; // custom persistence store
   ioBackend?: IoBackend;     // I/O primitives shorthand
   goalStore?: GoalStore;     // goal persistence store
+  customTools?: CustomTool[]; // host-supplied tools (see "Adding a custom tool")
+  baseInstructions?: string;  // prepended before instructions; defaults to DEFAULT_BASE_INSTRUCTIONS; pass "" to disable
+  skills?: SkillMetadata[];   // discovered skills for the always-on catalog (Layer 1)
+  loadSkillContent?: (skill: SkillMetadata) => Promise<string>; // full-body loader for $mention injection (Layer 2)
 });
 ```
 
@@ -417,6 +421,64 @@ export function Chat() {
     </div>
   );
 }
+```
+
+---
+
+## Base instructions and skills
+
+### Base instructions
+
+Mirrors the `base_instructions/default.md` agent harness in codex-rs. This is prepended ahead of `instructions` every turn to keep the model behaving as a tool-calling agent. The default (`DEFAULT_BASE_INSTRUCTIONS`) is a browser-adapted version with coding-specific content removed.
+
+```ts
+import { CodexThread, DEFAULT_BASE_INSTRUCTIONS } from "@ai0x0/codex-ts";
+
+// Use the default (recommended)
+const thread = new CodexThread({ apiKey, model });
+
+// Append your own text to the default harness
+const thread2 = new CodexThread({
+  apiKey, model,
+  baseInstructions: DEFAULT_BASE_INSTRUCTIONS + "\n\nAlways respond in French.",
+});
+
+// Disable entirely (model receives only `instructions`)
+const thread3 = new CodexThread({ apiKey, model, baseInstructions: "" });
+```
+
+### Skills
+
+Mirrors the two-layer skill injection in `codex-rs/core-skills/`. Filesystem discovery is the host's responsibility (the browser has no `readdir`); once found, skill metadata is passed in and codex-ts handles the rest.
+
+**Layer 1 — always-on catalog** (mirrors `render.rs`): a `## Skills` section listing every skill by name, description, and path is appended to `instructions` on every turn so the model sees what's available without reading files.
+
+**Layer 2 — full-body injection** (mirrors `injection.rs`): when the user mentions `$skill-name`, the skill's full `SKILL.md` is loaded via `loadSkillContent` and prepended to that turn's input as a `<skill>` block. Skill bodies are **not** persisted to history — they are turn-scoped context only.
+
+```ts
+import { CodexThread } from "@ai0x0/codex-ts";
+import type { SkillMetadata } from "@ai0x0/codex-ts";
+
+// Host discovers skills (e.g. by scanning .agents/skills/)
+const skills: SkillMetadata[] = [
+  { name: "song-analyzer", description: "Analyze a song.", path: ".agents/skills/song-analyzer/SKILL.md" },
+];
+
+const thread = new CodexThread({
+  apiKey, model,
+  skills,
+  // Host provides the reader (browser: fetch; Node.js: fs.readFile)
+  loadSkillContent: async (skill) => {
+    const res = await fetch(skill.path);
+    return res.text();
+  },
+});
+
+// User can trigger full-body injection with $skill-name
+await thread.submit({
+  type: "UserInput",
+  items: [{ type: "text", text: "use $song-analyzer on this track" }],
+});
 ```
 
 ---

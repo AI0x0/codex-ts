@@ -1,5 +1,12 @@
 export { CodexThread } from "./codex_thread.js";
 export type { CodexThreadConfig } from "./codex_thread.js";
+export { DEFAULT_BASE_INSTRUCTIONS } from "./base_instructions.js";
+export {
+  renderSkillsCatalog,
+  extractSkillMentions,
+  renderSkillInjection,
+} from "./skills.js";
+export type { SkillMetadata } from "./skills.js";
 export { ToolRouter } from "./tools/router.js";
 export type {
   CustomTool,

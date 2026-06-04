@@ -29,6 +29,9 @@ import type { ConversationItem } from "../../thread-store/src/types.js";
 import { ToolRouter } from "./tools/router.js";
 import type { CustomTool } from "./tools/router.js";
 import { runTurn } from "./session/turn.js";
+import { DEFAULT_BASE_INSTRUCTIONS } from "./base_instructions.js";
+import { renderSkillsCatalog } from "./skills.js";
+import type { SkillMetadata } from "./skills.js";
 import type { TurnConfig } from "./session/turn.js";
 import type { PendingInputs } from "./tools/handlers/request_user_input.js";
 
@@ -107,6 +110,23 @@ export interface CodexThreadConfig {
    * alongside the built-ins, and calls route to each tool's execute().
    */
   customTools?: CustomTool[] | undefined;
+  /**
+   * Base agent instructions prepended ahead of `instructions`. Mirrors
+   * codex-rs's base_instructions layer (the agent harness that keeps the model
+   * acting like a tool-calling agent). Defaults to DEFAULT_BASE_INSTRUCTIONS;
+   * pass "" to disable.
+   */
+  baseInstructions?: string | undefined;
+  /**
+   * Discovered skills (name + description + path). Rendered into an always-on
+   * "## Skills" catalog (Layer 1) and used to resolve `$skill-name` mentions for
+   * full-body injection (Layer 2). Mirrors codex-rs's core-skills crate, except
+   * discovery (scanning .agents/skills + parsing frontmatter) is the host's job
+   * since a browser has no filesystem.
+   */
+  skills?: SkillMetadata[] | undefined;
+  /** Reads a skill's full SKILL.md on demand (host-provided; browser has no fs). */
+  loadSkillContent?: ((skill: SkillMetadata) => Promise<string>) | undefined;
 }
 
 interface ResolvedConfig {
@@ -114,6 +134,9 @@ interface ResolvedConfig {
   baseUrl: string;
   model: string;
   instructions?: string | undefined;
+  baseInstructions: string;
+  skills: SkillMetadata[];
+  loadSkillContent?: ((skill: SkillMetadata) => Promise<string>) | undefined;
 }
 
 // ─── CodexThread ─────────────────────────────────────────────────────────────
@@ -149,6 +172,9 @@ export class CodexThread {
       baseUrl: config.baseUrl ?? "https://api.openai.com/v1",
       model: config.model,
       instructions: config.instructions,
+      baseInstructions: config.baseInstructions ?? DEFAULT_BASE_INSTRUCTIONS,
+      skills: config.skills ?? [],
+      loadSkillContent: config.loadSkillContent,
     };
 
     this.threadId = config.threadId ?? nextId();
@@ -202,12 +228,28 @@ export class CodexThread {
       case "UserInput": {
         const turnId = submissionId;
         // Per-turn overrides (op.*) take precedence over thread-level config.
-        const instructions = op.instructions ?? this.config.instructions;
+        // Developer instructions are layered on top of the base agent harness.
+        const devInstructions = op.instructions ?? this.config.instructions;
+        // Layer 1: the always-on skills catalog rides at the end of instructions.
+        const skillsCatalog = renderSkillsCatalog(this.config.skills);
+        const instructions = [
+          this.config.baseInstructions,
+          devInstructions,
+          skillsCatalog,
+        ]
+          .filter((part): part is string => Boolean(part))
+          .join("\n\n");
         const turnConfig: TurnConfig = {
           apiKey: this.config.apiKey,
           baseUrl: this.config.baseUrl,
           model: op.model ?? this.config.model,
-          ...(instructions !== undefined ? { instructions } : {}),
+          ...(instructions ? { instructions } : {}),
+          ...(this.config.skills.length > 0
+            ? { skills: this.config.skills }
+            : {}),
+          ...(this.config.loadSkillContent
+            ? { loadSkillContent: this.config.loadSkillContent }
+            : {}),
         };
 
         const abortController = new AbortController();
@@ -241,7 +283,7 @@ export class CodexThread {
           .catch((err: unknown) => {
             this.pushEvent(submissionId, {
               type: "Error",
-              event: { message: String(err) },
+              event: { message: String(err), turn_id: turnId },
             });
           })
           .finally(() => {

@@ -62,11 +62,15 @@ const thread = new CodexThread({
   apiKey: string;
   model: string;
   baseUrl?: string;          // 默认 https://api.openai.com/v1
-  instructions?: string;
+  instructions?: string;     // 开发者指令（追加在 base harness 之后）
   threadId?: string;         // 省略则自动生成；传入已有 ID 可 resume
   threadStore?: ThreadStore; // 自定义持久化存储（见下文）
   ioBackend?: IoBackend;     // I/O 原语注入（简写）
   goalStore?: GoalStore;     // goal 持久化存储
+  customTools?: CustomTool[]; // host 注入的工具（见"自定义扩展工具"）
+  baseInstructions?: string;  // 在 instructions 之前注入；默认 DEFAULT_BASE_INSTRUCTIONS；传 "" 可禁用
+  skills?: SkillMetadata[];   // 已发现的技能列表，用于生成常驻目录（Layer 1）
+  loadSkillContent?: (skill: SkillMetadata) => Promise<string>; // 按需加载 SKILL.md 全文（Layer 2）
 });
 ```
 
@@ -415,6 +419,64 @@ export function Chat() {
     </div>
   );
 }
+```
+
+---
+
+## 基础指令与技能
+
+### 基础指令（Base Instructions）
+
+照搬 codex-rs 的 `base_instructions/default.md` agent harness。每轮对话都会把它前置在 `instructions` 之前，确保模型表现得像一个工具调用 agent。默认值（`DEFAULT_BASE_INSTRUCTIONS`）是移除了编码专属内容的浏览器适配版本。
+
+```ts
+import { CodexThread, DEFAULT_BASE_INSTRUCTIONS } from "@ai0x0/codex-ts";
+
+// 使用默认（推荐）
+const thread = new CodexThread({ apiKey, model });
+
+// 在默认 harness 后追加自定义内容
+const thread2 = new CodexThread({
+  apiKey, model,
+  baseInstructions: DEFAULT_BASE_INSTRUCTIONS + "\n\n请始终用中文回复。",
+});
+
+// 完全禁用（模型只收到 instructions）
+const thread3 = new CodexThread({ apiKey, model, baseInstructions: "" });
+```
+
+### 技能（Skills）
+
+照搬 `codex-rs/core-skills/` 的两层技能注入机制。文件系统扫描由 host 负责（浏览器无法读取目录），codex-ts 负责渲染和注入。
+
+**Layer 1 — 常驻目录**（照搬 `render.rs`）：把所有技能的名称、描述、路径渲染为 `## Skills` 章节，拼接在每轮 `instructions` 末尾，让模型始终知道有哪些技能可用。
+
+**Layer 2 — 全文注入**（照搬 `injection.rs`）：用户消息中出现 `$skill-name` 时，通过 `loadSkillContent` 加载对应 `SKILL.md` 全文，以 `<skill>` 块的形式注入当轮输入的最前面。技能全文**不写入历史**——仅对当轮有效。
+
+```ts
+import { CodexThread } from "@ai0x0/codex-ts";
+import type { SkillMetadata } from "@ai0x0/codex-ts";
+
+// host 扫描技能目录（例如 .agents/skills/）
+const skills: SkillMetadata[] = [
+  { name: "song-analyzer", description: "分析一首歌曲。", path: ".agents/skills/song-analyzer/SKILL.md" },
+];
+
+const thread = new CodexThread({
+  apiKey, model,
+  skills,
+  // host 提供读取器（浏览器用 fetch，Node.js 用 fs.readFile）
+  loadSkillContent: async (skill) => {
+    const res = await fetch(skill.path);
+    return res.text();
+  },
+});
+
+// 用户用 $skill-name 触发全文注入
+await thread.submit({
+  type: "UserInput",
+  items: [{ type: "text", text: "用 $song-analyzer 分析这首曲子" }],
+});
 ```
 
 ---

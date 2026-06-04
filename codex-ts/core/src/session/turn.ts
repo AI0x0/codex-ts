@@ -14,6 +14,8 @@ import type { EventMsg } from "../../../protocol/src/protocol.js";
 import type { UserInput } from "../../../protocol/src/user_input.js";
 import { toolSpecToRequestJson } from "../../../tools/src/tool_spec.js";
 import { ToolRouter } from "../tools/router.js";
+import { extractSkillMentions, renderSkillInjection } from "../skills.js";
+import type { SkillMetadata } from "../skills.js";
 import type { PendingInputs } from "../tools/handlers/request_user_input.js";
 import type { LiveThread } from "../../../thread-store/src/live_thread.js";
 import type { ConversationItem } from "../../../thread-store/src/types.js";
@@ -69,6 +71,13 @@ export interface TurnConfig {
   baseUrl: string;
   model: string;
   instructions?: string | undefined;
+  /** Discovered skills, for `$skill-name` full-body injection (Layer 2). */
+  skills?: SkillMetadata[] | undefined;
+  /**
+   * Reads a skill's full SKILL.md on demand. Host-provided because a browser
+   * has no filesystem (mirrors how IoBackend is injected).
+   */
+  loadSkillContent?: ((skill: SkillMetadata) => Promise<string>) | undefined;
 }
 
 // ─── runTurn ─────────────────────────────────────────────────────────────────
@@ -104,6 +113,31 @@ export async function runTurn(
   history.push(userMsg);
   await liveThread?.appendConversationItems([userMsg]);
 
+  // ── Layer 2: turn-scoped skill full-body injection (mirrors codex-rs) ──────
+  // A `$skill-name` mention in user input pulls that skill's full SKILL.md into
+  // THIS turn's request input only. Like codex-rs contextual fragments, these
+  // items are NOT pushed to history / persisted — resume stays clean and the
+  // body isn't duplicated every turn.
+  const skillInjectionItems: HistoryItem[] = [];
+  const loadSkillContent = config.loadSkillContent;
+  if (config.skills && config.skills.length > 0 && loadSkillContent) {
+    const userText = userItems
+      .map((item) => (item.type === "text" ? item.text : ""))
+      .join("\n");
+    const mentioned = extractSkillMentions(userText, config.skills);
+    for (const skill of mentioned) {
+      const contents = await loadSkillContent(skill).catch(() => null);
+      if (contents !== null) {
+        skillInjectionItems.push({
+          role: "user",
+          content: [
+            { type: "input_text", text: renderSkillInjection(skill, contents) },
+          ],
+        });
+      }
+    }
+  }
+
   const tools = router.toolSpecs().map(toolSpecToRequestJson);
   let lastAgentMessage = "";
   let itemIdCounter = 0;
@@ -117,7 +151,11 @@ export async function runTurn(
     // ── Sample from the model ───────────────────────────────────────────────
     const body: Record<string, unknown> = {
       model: config.model,
-      input: history,
+      // Skill bodies ride at the front as turn-scoped context, ahead of the
+      // persisted conversation history.
+      input: skillInjectionItems.length
+        ? [...skillInjectionItems, ...history]
+        : history,
       tools,
       stream: true,
     };
