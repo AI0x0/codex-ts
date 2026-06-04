@@ -10,9 +10,11 @@
 
 - **浏览器原生** — 仅使用标准 `fetch` / `ReadableStream`，零 polyfill，零运行时依赖
 - **照搬 codex-rs 设计** — 目录结构、类型命名、API（`submit` / `nextEvent`）与 Rust 版本一一对应
+- **自动上下文压缩** — 照搬 codex-rs compact.rs：BodyAfterPrefix 模式追踪 token 增长，达到阈值时自动摘要历史，保证模型不超出上下文窗口
 - **可注入持久化** — `ThreadStore` / `IoBackend` / `GoalStore` 均可替换，Node.js 写文件、浏览器用 OPFS 或 IndexedDB，接口不变
-- **可扩展工具** — 新增工具只需在 `ToolRouter` 加一个 `case`，对话历史、SSE 解析、事件队列均已就绪
-- **多轮对话** — `CodexThread` 自动维护对话历史，多次 `submit` 持续对话
+- **基础指令 + 技能** — 从 codex-rs core-skills 照搬的两层技能注入（目录 + `$mention`）和 agent harness 基础指令
+- **可扩展工具** — 实现 `CustomTool` 接口注入即可，`ToolRouter`、SSE 解析、历史管理、事件队列已就绪
+- **多轮对话** — `CodexThread` 自动维护对话历史，通过 `IoBackend` 跨页面刷新持久化和恢复
 
 ---
 
@@ -71,6 +73,7 @@ const thread = new CodexThread({
   baseInstructions?: string;  // 在 instructions 之前注入；默认 DEFAULT_BASE_INSTRUCTIONS；传 "" 可禁用
   skills?: SkillMetadata[];   // 已发现的技能列表，用于生成常驻目录（Layer 1）
   loadSkillContent?: (skill: SkillMetadata) => Promise<string>; // 按需加载 SKILL.md 全文（Layer 2）
+  autoCompactTokenLimit?: number;  // 内联自动压缩的 token 阈值（推荐：context_window × 0.9）
 });
 ```
 
@@ -108,6 +111,8 @@ interface Event {
 | `RequestUserInput` | 模型提问，需提交 `UserInputAnswer` 恢复 |
 | `ThreadGoalUpdated` | goal 状态变更 |
 | `PlanUpdate` | 任务清单更新，含步骤列表和各步骤状态 |
+| `ContextCompacted` | 内联压缩已执行，历史已替换为摘要 |
+| `Warning` | 建议信息（如压缩后的线程卫生提醒） |
 | `Error` | 执行出错 |
 
 ---
@@ -357,6 +362,43 @@ const resumed = await CodexThread.create({
 // 历史已从 backend 加载，再 submit 时模型能看到完整上下文
 await resumed.submit({ type: "UserInput", items: [{ type: "text", text: "继续" }] });
 ```
+
+---
+
+## 上下文自动压缩
+
+照搬 `codex-rs/core/src/compact.rs`。当上下文增长超过 `autoCompactTokenLimit` 时，agent 自动用一次独立请求总结历史并替换 history，让模型在不失去任务连续性的情况下保持在上下文窗口内。
+
+**算法（BodyAfterPrefix 模式，与 codex-rs 默认一致）：**
+
+1. 每次 sampling 结束从 `response.done` 取 `input_tokens`
+2. 第一次采样设定基线；后续采样测量增量：`scope_tokens = current − baseline`
+3. 当 `scope_tokens ≥ autoCompactTokenLimit` 且**还有工具调用需要继续执行**时触发压缩：
+   - 发一条独立请求：完整历史 + `SUMMARIZATION_PROMPT`，取模型返回的摘要
+   - 摘要前置 `SUMMARY_PREFIX`，作为最后一条用户消息
+   - 最近 20 000 token 以内的用户消息拼在摘要之前
+   - 原地替换 `history`，发出 `ContextCompacted` + `Warning` 事件
+   - 重置 token 基线，进入新窗口
+
+```ts
+// 推荐值：context_window × 0.9
+// gpt-4o 128k 上下文 → ~115 000
+const thread = new CodexThread({
+  apiKey: "sk-...",
+  model: "gpt-4o",
+  autoCompactTokenLimit: 115_000,
+});
+
+for (;;) {
+  const { msg } = await thread.nextEvent();
+  if (msg.type === "ContextCompacted") {
+    console.log("历史已压缩，继续执行…");
+  }
+  if (msg.type === "TurnComplete") break;
+}
+```
+
+不传 `autoCompactTokenLimit` 则完全禁用压缩。
 
 ---
 

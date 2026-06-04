@@ -12,9 +12,11 @@ Forked from [`openai/codex@6bcccb0e`](https://github.com/openai/codex/commit/6bc
 
 - **Browser-native** — uses only standard `fetch` / `ReadableStream`, zero polyfills, zero runtime dependencies
 - **Mirrors codex-rs** — directory layout, type names, and API (`submit` / `nextEvent`) match the Rust implementation one-to-one
+- **Auto-compaction** — context window management mirrors codex-rs: BodyAfterPrefix token tracking triggers inline summarisation before the model hits its limit
 - **Injectable persistence** — `ThreadStore` / `IoBackend` / `GoalStore` are all replaceable; Node.js writes files, browser uses OPFS or IndexedDB — same interface either way
-- **Extensible tools** — add a new tool with a single `case` in `ToolRouter`; SSE parsing, conversation history, and the event queue are already wired up
-- **Multi-turn conversation** — `CodexThread` maintains conversation history automatically across turns
+- **Base instructions + skills** — agent harness and two-layer skill injection (catalog + `$mention`) ported from codex-rs core-skills
+- **Extensible tools** — add a new tool by implementing `CustomTool` and passing it to `CodexThread`; `ToolRouter`, SSE parsing, history, and the event queue are already wired up
+- **Multi-turn conversation** — `CodexThread` maintains conversation history and resumes across page reloads via `IoBackend`
 
 ---
 
@@ -73,6 +75,7 @@ const thread = new CodexThread({
   baseInstructions?: string;  // prepended before instructions; defaults to DEFAULT_BASE_INSTRUCTIONS; pass "" to disable
   skills?: SkillMetadata[];   // discovered skills for the always-on catalog (Layer 1)
   loadSkillContent?: (skill: SkillMetadata) => Promise<string>; // full-body loader for $mention injection (Layer 2)
+  autoCompactTokenLimit?: number;  // token threshold for inline auto-compaction (e.g. context_window × 0.9)
 });
 ```
 
@@ -114,6 +117,8 @@ Async factory — use instead of `new` when resuming an existing thread. Loads c
 | `RequestUserInput` | Model is asking the user; submit `UserInputAnswer` to resume |
 | `ThreadGoalUpdated` | Goal state changed |
 | `PlanUpdate` | Task checklist updated with step list and statuses |
+| `ContextCompacted` | Inline compaction ran; history has been replaced with a summary |
+| `Warning` | Advisory (e.g. post-compaction thread hygiene reminder) |
 | `Error` | Execution error |
 
 ---
@@ -362,6 +367,43 @@ const resumed = await CodexThread.create({
 
 ---
 
+## Context compaction
+
+Mirrors `codex-rs/core/src/compact.rs`. When the context grows past `autoCompactTokenLimit`, the agent automatically summarises its conversation history with a fresh model request and replaces the history with the summary — keeping the model within its context window without losing task continuity.
+
+**Algorithm (BodyAfterPrefix mode, matching codex-rs default):**
+
+1. Each sampling round records `input_tokens` from `response.done`
+2. The first round in a window sets the baseline; subsequent rounds measure growth: `scope_tokens = current − baseline`
+3. When `scope_tokens ≥ autoCompactTokenLimit` **and** tool calls remain (mid-turn), compaction fires:
+   - A separate request sends the full history + `SUMMARIZATION_PROMPT` to the model
+   - The summary is prefixed with `SUMMARY_PREFIX` and stored as the last user message
+   - Recent user messages (up to 20 000 tokens) are prepended before the summary
+   - History is replaced in-place; `ContextCompacted` + `Warning` events are emitted
+   - The token baseline resets for the next window (`startNext()`)
+
+```ts
+// Recommended value: 90% of the model's context window
+// gpt-4o has a 128 k context → ~115 000
+const thread = new CodexThread({
+  apiKey: "sk-...",
+  model: "gpt-4o",
+  autoCompactTokenLimit: 115_000,
+});
+
+for (;;) {
+  const { msg } = await thread.nextEvent();
+  if (msg.type === "ContextCompacted") {
+    console.log("History compacted — continuing…");
+  }
+  if (msg.type === "TurnComplete") break;
+}
+```
+
+Omit `autoCompactTokenLimit` to disable compaction entirely.
+
+---
+
 ## Browser usage (React example)
 
 ```tsx
@@ -563,7 +605,14 @@ codex-ts/
 └── core/
     ├── src/
     │   ├── codex_thread.ts          ←   codex_thread.rs    (submit / nextEvent)
-    │   ├── session/turn.ts          ←   session/turn.rs    (runTurn + SSE parsing)
+    │   ├── compact.ts               ←   compact.rs         (SUMMARIZATION_PROMPT, runInlineAutoCompactTask)
+    │   ├── base_instructions.ts     ←   prompts/base_instructions/default.md
+    │   ├── skills.ts                ←   core-skills/src/   (render + injection + skill_instructions)
+    │   ├── state/
+    │   │   └── auto_compact_window.ts ← state/auto_compact_window.rs
+    │   ├── session/
+    │   │   ├── turn.ts              ←   session/turn.rs    (runTurn + compaction trigger)
+    │   │   └── sse.ts               ←   (shared SSE parser)
     │   └── tools/
     │       ├── router.ts            ←   tools/router.rs
     │       └── handlers/
@@ -576,9 +625,11 @@ codex-ts/
         └── suite/
             ├── goal.test.ts                    ←   tool_harness.rs (goal)
             ├── plan.test.ts                    ←   tool_harness.rs (plan)
+            ├── compact.test.ts                 ←   compact.rs tests
             ├── request_user_input.test.ts      ←   request_user_input.rs
             ├── resume.test.ts                  ←   resume.rs
-            └── extensions.test.ts              ←   [browser ext]  (CustomTool, Interrupt)
+            ├── skills.test.ts                  ←   core-skills tests
+            └── extensions.test.ts              ←   [browser ext]  (CustomTool, Interrupt, baseInstructions)
 ```
 
 ---
@@ -626,6 +677,9 @@ so you know at a glance whether a diff from upstream requires action:
 | `plan_spec.rs` / `plan_tool.rs` — schema change | `core/src/tools/handlers/plan_spec.ts` + `protocol/src/plan_tool.ts` |
 | `thread-store/src/store.rs` — interface change | `thread-store/src/store.ts` |
 | `state/src/runtime/goals.rs` — accounting change | `state/src/runtime/goals.ts` |
+| `compact.rs` — compaction logic change | `core/src/compact.ts` |
+| `state/auto_compact_window.rs` — window tracking change | `core/src/state/auto_compact_window.ts` |
+| `prompts/templates/compact/prompt.md` — summarisation prompt | `SUMMARIZATION_PROMPT` in `core/src/compact.ts` |
 | New tool added | `core/src/tools/router.ts` |
 
 ### Sync workflow
