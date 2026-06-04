@@ -73,7 +73,7 @@ const thread = new CodexThread({
   baseInstructions?: string;  // 在 instructions 之前注入；默认 DEFAULT_BASE_INSTRUCTIONS；传 "" 可禁用
   skills?: SkillMetadata[];   // 已发现的技能列表，用于生成常驻目录（Layer 1）
   loadSkillContent?: (skill: SkillMetadata) => Promise<string>; // 按需加载 SKILL.md 全文（Layer 2）
-  agentsMd?: string;           // AGENTS.md 内容，通过 "--- project-doc ---" 分隔符合并入指令
+  agentsMd?: string;           // AGENTS.md 内容，作为独立 input 消息注入（不合并到 instructions 字段）
   autoCompactTokenLimit?: number;  // 内联自动压缩的 token 阈值（推荐：context_window × 0.9）
 });
 ```
@@ -492,7 +492,7 @@ const thread3 = new CodexThread({ apiKey, model, baseInstructions: "" });
 
 照搬 `codex-rs/core-skills/` 的两层技能注入机制。文件系统扫描由 host 负责（浏览器无法读取目录），codex-ts 负责渲染和注入。
 
-**Layer 1 — 常驻目录**（照搬 `render.rs`）：把所有技能的名称、描述、路径渲染为 `## Skills` 章节，拼接在每轮 `instructions` 末尾。描述会按 `SkillMetadataBudget` 预算裁剪，默认为模型上下文窗口的 2%（不知窗口大小时退化为 8 000 字符上限）。当预算不足时自动截短描述或追加遗漏警告，行为与 codex-rs 完全一致。
+**Layer 1 — 常驻目录**（照搬 `render.rs`）：把所有技能的名称、描述、路径渲染为 `## Skills` 章节，以独立的 `input` 消息形式注入每轮请求（而非拼在 `instructions` 字段），让模型将其视为独立的上下文边界。描述会按 `SkillMetadataBudget` 预算裁剪，默认为模型上下文窗口的 2%（不知窗口大小时退化为 8 000 字符上限）。当预算不足时自动截短描述或追加遗漏警告，行为与 codex-rs 完全一致。
 
 **Layer 2 — 全文注入**（照搬 `injection.rs`）：用户消息中出现 `$skill-name` 时，通过 `loadSkillContent` 加载对应 `SKILL.md` 全文，以 `<skill>` 块的形式注入当轮输入的最前面。技能全文**不写入历史**——仅对当轮有效。
 
@@ -524,20 +524,20 @@ await thread.submit({
 
 ### AGENTS.md（项目文档注入）
 
-照搬 `codex-rs/core/src/agents_md.rs`。将项目 `AGENTS.md` 的内容通过 `agentsMd` 字段传入，codex-ts 会使用 `--- project-doc ---` 分隔符（codex-rs `AGENTS_MD_SEPARATOR`）将其合并到开发者指令之后。文件读取和选择（例如优先使用 `AGENTS.override.md`）由 host 负责。
+照搬 `codex-rs/core/src/agents_md.rs`（UserInstructions 片段）。将项目 `AGENTS.md` 的内容通过 `agentsMd` 字段传入，codex-ts 会将其作为独立的 `input` 消息注入到对话历史之前——**不**合并到 `instructions` 字段——让模型将开发者指令和项目文档视为独立的上下文边界，与 codex-rs 的 contextItems 架构保持一致。文件读取和选择（例如优先使用 `AGENTS.override.md`）由 host 负责。
 
 ```ts
 const thread = new CodexThread({
   apiKey, model,
   instructions: "你是一个助手。",
-  // 项目 AGENTS.md 的内容
   agentsMd: `## 项目背景\n这是一个音乐平台...`,
 });
-// 发送给模型的有效指令：
-//   "你是一个助手。\n\n--- project-doc ---\n\n## 项目背景\n..."
+// 模型在 input 中看到的内容（在历史之前）：
+//   { role: "user", content: "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n## 项目背景\n...\n</INSTRUCTIONS>" }
+// instructions 字段只包含：base harness + "你是一个助手。"
 ```
 
-当只传 `agentsMd` 不传 `instructions` 时，内容直接出现，不会有多余的分隔符前缀；未提供 `agentsMd` 时，分隔符从不出现。
+未提供 `agentsMd` 时，不注入任何 AGENTS.md 消息。`input` 的注入顺序与 codex-rs TurnContext 一致：`agentsMd 消息 → 技能目录消息 → $mention 技能全文 → 对话历史`。
 
 ---
 

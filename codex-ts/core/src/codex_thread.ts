@@ -128,10 +128,13 @@ export interface CodexThreadConfig {
   /** Reads a skill's full SKILL.md on demand (host-provided; browser has no fs). */
   loadSkillContent?: ((skill: SkillMetadata) => Promise<string>) | undefined;
   /**
-   * Project documentation (AGENTS.md content), merged into the developer
-   * instructions with codex-rs's `--- project-doc ---` separator. Mirrors
-   * codex-rs's AgentsMdManager; discovery (finding AGENTS.override.md / AGENTS.md)
-   * is the host's job since a browser has no filesystem.
+   * Project documentation (AGENTS.md content). Mirrors codex-rs's
+   * AgentsMdManager / UserInstructions fragment: injected as a discrete
+   * `input` message (format: "# AGENTS.md instructions\n\n<INSTRUCTIONS>…")
+   * ahead of the conversation history so the model sees it as a separate
+   * context boundary — NOT merged into the `instructions` field.
+   * Discovery (finding AGENTS.override.md / AGENTS.md) is the host's job
+   * since a browser has no filesystem.
    */
   agentsMd?: string | undefined;
   /**
@@ -249,26 +252,43 @@ export class CodexThread {
         // Per-turn overrides (op.*) take precedence over thread-level config.
         // Developer instructions are layered on top of the base agent harness.
         const devInstructions = op.instructions ?? this.config.instructions;
-        // mirrors agents_md.rs AGENTS_MD_SEPARATOR = "\n\n--- project-doc ---\n\n"
-        // and AgentsMdManager::user_instructions() which concatenates dev instructions
-        // with the project doc using that separator.
-        const devWithProjectDoc = [devInstructions, this.config.agentsMd]
-          .filter((part): part is string => Boolean(part))
-          .join("\n\n--- project-doc ---\n\n");
-        // Layer 1: the always-on skills catalog rides at the end of instructions.
-        const skillsCatalog = renderSkillsCatalog(this.config.skills);
-        const instructions = [
-          this.config.baseInstructions,
-          devWithProjectDoc,
-          skillsCatalog,
-        ]
+        // instructions field = base agent harness + developer (app-level)
+        // instructions, mirroring codex-rs where base/developer go in
+        // `instructions`. Project docs + catalog ride in `input` instead.
+        const instructions = [this.config.baseInstructions, devInstructions]
           .filter((part): part is string => Boolean(part))
           .join("\n\n");
+        // codex-rs puts the project doc + skills catalog in `input` as discrete
+        // contextual messages so each boundary is explicit to the model (see
+        // TurnConfig.contextItems) rather than baked into the instructions blob.
+        const contextItems: ConversationItem[] = [];
+        // AGENTS.md → user_instructions message (codex-rs UserInstructions
+        // fragment: # AGENTS.md instructions / <INSTRUCTIONS> markers).
+        if (this.config.agentsMd) {
+          contextItems.push({
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: `# AGENTS.md instructions\n\n<INSTRUCTIONS>\n${this.config.agentsMd}\n</INSTRUCTIONS>`,
+              },
+            ],
+          });
+        }
+        // skills catalog message (codex-rs available-skills fragment).
+        const skillsCatalog = renderSkillsCatalog(this.config.skills);
+        if (skillsCatalog) {
+          contextItems.push({
+            role: "user",
+            content: [{ type: "input_text", text: skillsCatalog }],
+          });
+        }
         const turnConfig: TurnConfig = {
           apiKey: this.config.apiKey,
           baseUrl: this.config.baseUrl,
           model: op.model ?? this.config.model,
           ...(instructions ? { instructions } : {}),
+          ...(contextItems.length > 0 ? { contextItems } : {}),
           ...(this.config.skills.length > 0
             ? { skills: this.config.skills }
             : {}),

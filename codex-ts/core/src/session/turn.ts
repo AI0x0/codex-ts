@@ -51,6 +51,13 @@ export interface TurnConfig {
    * Omit to disable auto-compaction.
    */
   autoCompactTokenLimit?: number | undefined;
+  /**
+   * Turn-scoped context messages prepended to `input` ahead of history,
+   * mirroring codex-rs's contextual user fragments: user_instructions
+   * (developer + AGENTS.md) and the skills catalog ride here as discrete
+   * messages rather than baked into the `instructions` field. Not persisted.
+   */
+  contextItems?: HistoryItem[] | undefined;
 }
 
 // ─── runTurn ─────────────────────────────────────────────────────────────────
@@ -129,11 +136,14 @@ export async function runTurn(
     // ── Sample from the model ───────────────────────────────────────────────
     const body: Record<string, unknown> = {
       model: config.model,
-      // Skill bodies ride at the front as turn-scoped context, ahead of the
-      // persisted conversation history.
-      input: skillInjectionItems.length
-        ? [...skillInjectionItems, ...history]
-        : history,
+      // codex-rs structure: turn-scoped context (user_instructions + skills
+      // catalog) and any $mention skill bodies ride at the front, ahead of the
+      // persisted conversation history. None of these are persisted.
+      input: [
+        ...(config.contextItems ?? []),
+        ...skillInjectionItems,
+        ...history,
+      ],
       tools,
       stream: true,
     };

@@ -75,7 +75,7 @@ const thread = new CodexThread({
   baseInstructions?: string;  // prepended before instructions; defaults to DEFAULT_BASE_INSTRUCTIONS; pass "" to disable
   skills?: SkillMetadata[];   // discovered skills for the always-on catalog (Layer 1)
   loadSkillContent?: (skill: SkillMetadata) => Promise<string>; // full-body loader for $mention injection (Layer 2)
-  agentsMd?: string;           // AGENTS.md content merged into instructions via "--- project-doc ---" separator
+  agentsMd?: string;           // AGENTS.md content injected as a discrete input message (not merged into instructions)
   autoCompactTokenLimit?: number;  // token threshold for inline auto-compaction (e.g. context_window × 0.9)
 });
 ```
@@ -494,7 +494,7 @@ const thread3 = new CodexThread({ apiKey, model, baseInstructions: "" });
 
 Mirrors the two-layer skill injection in `codex-rs/core-skills/`. Filesystem discovery is the host's responsibility (the browser has no `readdir`); once found, skill metadata is passed in and codex-ts handles the rest.
 
-**Layer 1 — always-on catalog** (mirrors `render.rs`): a `## Skills` section is appended to `instructions` every turn. Descriptions are budget-trimmed to fit within `SkillMetadataBudget` — defaulting to 2% of the model's context window in tokens (or 8 000 characters when the window is unknown). When the budget is exceeded, shorter descriptions or omission warnings are injected automatically, matching codex-rs behaviour exactly.
+**Layer 1 — always-on catalog** (mirrors `render.rs`): a `## Skills` section is injected every turn as a discrete `input` message (not baked into `instructions`), so the model sees it as a separate context boundary. Descriptions are budget-trimmed to fit within `SkillMetadataBudget` — defaulting to 2% of the model's context window in tokens (or 8 000 characters when the window is unknown). When the budget is exceeded, shorter descriptions or omission warnings are injected automatically, matching codex-rs behaviour exactly.
 
 **Layer 2 — full-body injection** (mirrors `injection.rs`): when the user mentions `$skill-name`, the skill's full `SKILL.md` is loaded via `loadSkillContent` and prepended to that turn's input as a `<skill>` block. Skill bodies are **not** persisted to history — they are turn-scoped context only.
 
@@ -526,20 +526,20 @@ await thread.submit({
 
 ### AGENTS.md (project documentation)
 
-Mirrors `codex-rs/core/src/agents_md.rs`. Pass the content of your project's `AGENTS.md` as `agentsMd`; it is merged into the developer instructions using the `--- project-doc ---` separator (codex-rs `AGENTS_MD_SEPARATOR`). Reading and selecting the file (e.g. preferring `AGENTS.override.md`) is the host's responsibility — the browser has no filesystem.
+Mirrors `codex-rs/core/src/agents_md.rs` (UserInstructions fragment). Pass the content of your project's `AGENTS.md` as `agentsMd`; it is injected as a discrete `input` message ahead of the conversation history — **not** merged into the `instructions` field. This keeps developer instructions and project documentation as separate model-visible boundaries, matching codex-rs's contextual fragment architecture. Reading and selecting the file (e.g. preferring `AGENTS.override.md`) is the host's responsibility — the browser has no filesystem.
 
 ```ts
 const thread = new CodexThread({
   apiKey, model,
   instructions: "You are a helpful assistant.",
-  // Content of your project's AGENTS.md
   agentsMd: `## Project context\nThis is a music platform...`,
 });
-// Effective instructions sent to the model:
-//   "You are a helpful assistant.\n\n--- project-doc ---\n\n## Project context\n..."
+// What the model sees in `input` (before history):
+//   { role: "user", content: "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n## Project context\n...\n</INSTRUCTIONS>" }
+// `instructions` field contains only: base harness + "You are a helpful assistant."
 ```
 
-When `agentsMd` is provided without `instructions`, the project doc appears alone (no orphaned separator). When `agentsMd` is absent, the separator is never injected.
+When `agentsMd` is absent, no AGENTS.md message is injected. The `input` ordering mirrors codex-rs TurnContext: `agentsMd message → skills catalog message → $mention skill bodies → conversation history`.
 
 ---
 

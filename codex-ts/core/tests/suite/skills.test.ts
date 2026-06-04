@@ -113,9 +113,14 @@ describe("skill injection inside a turn", () => {
     await waitForEvent(codex, (m) => m.type === "TurnComplete");
 
     const init = fetchMock.mock.calls[0]![1] as RequestInit;
-    const body = JSON.parse(init.body as string) as { instructions: string };
-    expect(body.instructions).toContain("## Skills");
-    expect(body.instructions).toContain("- song-analyzer:");
+    const body = JSON.parse(init.body as string) as {
+      instructions?: string;
+      input: unknown[];
+    };
+    // Catalog rides as a discrete input message, NOT in the instructions field.
+    expect(body.instructions ?? "").not.toContain("## Skills");
+    expect(JSON.stringify(body.input)).toContain("## Skills");
+    expect(JSON.stringify(body.input)).toContain("- song-analyzer:");
   });
 
   it("injects the full skill body on $mention, ahead of history (Layer 2)", async () => {
@@ -151,10 +156,11 @@ describe("skill injection inside a turn", () => {
 
     const init = fetchMock.mock.calls[0]![1] as RequestInit;
     const body = JSON.parse(init.body as string) as { input: unknown[] };
-    // The skill body rides at the front of the input.
-    expect(JSON.stringify(body.input[0])).toContain("<skill>");
-    expect(JSON.stringify(body.input[0])).toContain("BODY:song-analyzer");
-    // The real user message stays last (skill body is turn-scoped context).
+    // The skill body rides in input as a turn-scoped message (after the catalog).
+    const inputStr = JSON.stringify(body.input);
+    expect(inputStr).toContain("<skill>");
+    expect(inputStr).toContain("BODY:song-analyzer");
+    // The real user message stays last (context messages are prepended).
     expect(JSON.stringify(body.input[body.input.length - 1])).toContain(
       "use $song-analyzer please",
     );
@@ -201,7 +207,7 @@ describe("catalog budget (mirrors render.rs)", () => {
   }));
 
   it("defaultSkillMetadataBudget: 2% tokens with a context window, else 8000 chars", () => {
-    expect(defaultSkillMetadataBudget(128_000)).toEqual({
+    expect(defaultSkillMetadataBudget(/*contextWindow*/ 128_000)).toEqual({
       kind: "tokens",
       limit: 2_560,
     });
@@ -259,15 +265,18 @@ describe("catalog budget (mirrors render.rs)", () => {
 
 describe("AGENTS.md injection (mirrors AgentsMdManager)", () => {
   /**
-   * Mirrors agents_md_tests.rs — the separator is "\n\n--- project-doc ---\n\n"
-   * (codex-rs AGENTS_MD_SEPARATOR const in agents_md.rs:42).
-   * When agentsMd is absent the separator must NOT appear in the instructions.
+   * Mirrors codex-rs AgentsMdManager / user_instructions fragment behaviour.
+   * Architecture: agentsMd rides as a discrete user_instructions `input`
+   * message (format: "# AGENTS.md instructions\n\n<INSTRUCTIONS>…</INSTRUCTIONS>"),
+   * NOT merged into the `instructions` field — this keeps developer instructions
+   * and project docs as separate model-visible boundaries (codex-rs contextItems).
+   * When agentsMd is absent, no AGENTS.md message is injected.
    */
   beforeEach(() => {
     vi.unstubAllGlobals();
   });
 
-  it("merges agentsMd into instructions with the project-doc separator", async () => {
+  it("rides agentsMd as a discrete user_instructions input message", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       makeSseResponse(
         sseFlat([
@@ -292,14 +301,21 @@ describe("AGENTS.md injection (mirrors AgentsMdManager)", () => {
     await waitForEvent(codex, (m) => m.type === "TurnComplete");
 
     const init = fetchMock.mock.calls[0]![1] as RequestInit;
-    const body = JSON.parse(init.body as string) as { instructions: string };
-    expect(body.instructions).toContain("DEV_INSTRUCTIONS");
-    expect(body.instructions).toContain("--- project-doc ---");
-    expect(body.instructions).toContain("PROJECT_DOC_BODY");
+    const body = JSON.parse(init.body as string) as {
+      instructions?: string;
+      input: unknown[];
+    };
+    // Developer instructions stay in the instructions field (base + developer);
+    // AGENTS.md rides as a discrete user_instructions input message.
+    expect(body.instructions ?? "").toContain("DEV_INSTRUCTIONS");
+    const inputStr = JSON.stringify(body.input);
+    expect(inputStr).toContain("# AGENTS.md instructions");
+    expect(inputStr).toContain("PROJECT_DOC_BODY");
+    expect(body.instructions ?? "").not.toContain("PROJECT_DOC_BODY");
   });
 
-  it("uses agentsMd alone (no instructions) without a leading separator", async () => {
-    // mirrors agents_md_tests.rs: no user_instructions + doc → just the doc
+  it("rides agentsMd in an input message even when base is empty", async () => {
+    // base "" → empty instructions; agentsMd still rides as an input message
     const fetchMock = vi.fn().mockResolvedValue(
       makeSseResponse(
         sseFlat([
@@ -324,14 +340,16 @@ describe("AGENTS.md injection (mirrors AgentsMdManager)", () => {
     await waitForEvent(codex, (m) => m.type === "TurnComplete");
 
     const init = fetchMock.mock.calls[0]![1] as RequestInit;
-    const body = JSON.parse(init.body as string) as { instructions: string };
-    expect(body.instructions).toContain("ONLY_PROJECT_DOC");
-    // No orphaned separator at the start
-    expect(body.instructions).not.toMatch(/^--- project-doc ---/);
+    const body = JSON.parse(init.body as string) as {
+      instructions?: string;
+      input: unknown[];
+    };
+    expect(JSON.stringify(body.input)).toContain("ONLY_PROJECT_DOC");
+    expect(body.instructions ?? "").not.toContain("ONLY_PROJECT_DOC");
   });
 
-  it("omits the separator entirely when no agentsMd is provided", async () => {
-    // mirrors agents_md_tests.rs: instructions + no doc → no separator
+  it("emits no AGENTS.md input message when none is provided", async () => {
+    // instructions + no doc → developer text in instructions, no AGENTS.md msg
     const fetchMock = vi.fn().mockResolvedValue(
       makeSseResponse(
         sseFlat([
@@ -356,8 +374,60 @@ describe("AGENTS.md injection (mirrors AgentsMdManager)", () => {
     await waitForEvent(codex, (m) => m.type === "TurnComplete");
 
     const init = fetchMock.mock.calls[0]![1] as RequestInit;
-    const body = JSON.parse(init.body as string) as { instructions: string };
-    expect(body.instructions).toContain("DEV_INSTRUCTIONS");
-    expect(body.instructions).not.toContain("--- project-doc ---");
+    const body = JSON.parse(init.body as string) as {
+      instructions?: string;
+      input: unknown[];
+    };
+    // Developer instructions ride in the instructions field; no AGENTS.md message.
+    expect(body.instructions ?? "").toContain("DEV_INSTRUCTIONS");
+    expect(JSON.stringify(body.input)).not.toContain("# AGENTS.md instructions");
+  });
+
+  it("orders context items: agentsMd → catalog → $mention body → user message", async () => {
+    // Verifies the full input ordering mirrors codex-rs TurnContext:
+    //   contextItems (agentsMd, catalog) → skillInjectionItems ($mention) → history
+    const fetchMock = vi.fn().mockResolvedValue(
+      makeSseResponse(
+        sseFlat([
+          evResponseCreated("r1"),
+          evAssistantMessage("ok"),
+          evCompleted("r1"),
+        ]),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const codex = new CodexThread({
+      apiKey: "k",
+      model: "m",
+      baseInstructions: "",
+      agentsMd: "PROJECT_DOC",
+      skills: SKILLS,
+      loadSkillContent: async () => "SKILL_BODY",
+    });
+    await codex.submit({
+      type: "UserInput",
+      items: [{ type: "text", text: "use $song-analyzer please" }],
+    });
+    await waitForEvent(codex, (m) => m.type === "TurnComplete");
+
+    const init = fetchMock.mock.calls[0]![1] as RequestInit;
+    const body = JSON.parse(init.body as string) as { input: unknown[] };
+    const inputStr = JSON.stringify(body.input);
+
+    // All four layers must be present
+    expect(inputStr).toContain("# AGENTS.md instructions"); // agentsMd
+    expect(inputStr).toContain("## Skills");               // catalog
+    expect(inputStr).toContain("<skill>");                  // $mention body
+    expect(inputStr).toContain("use $song-analyzer please"); // user message
+
+    // Ordering: agentsMd before catalog before $mention before user message
+    const posAgentsMd = inputStr.indexOf("# AGENTS.md instructions");
+    const posCatalog  = inputStr.indexOf("## Skills");
+    const posSkill    = inputStr.indexOf("<skill>");
+    const posUser     = inputStr.indexOf("use $song-analyzer please");
+    expect(posAgentsMd).toBeLessThan(posCatalog);
+    expect(posCatalog).toBeLessThan(posSkill);
+    expect(posSkill).toBeLessThan(posUser);
   });
 });

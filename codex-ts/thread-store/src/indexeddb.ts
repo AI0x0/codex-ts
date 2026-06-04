@@ -39,7 +39,7 @@ export class IndexedDBIoBackend implements IoBackend {
   private openDb(): Promise<IDBDatabase> {
     if (this.dbPromise) return this.dbPromise;
     this.dbPromise = new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open(this.dbName, 1);
+      const req = indexedDB.open(this.dbName, /*version*/ 1);
       req.onupgradeneeded = () => {
         const db = req.result;
         if (!db.objectStoreNames.contains(STORE_NAME)) {

@@ -129,7 +129,7 @@ function descriptionBudgetLine(
   skill: SkillMetadata,
   budget: SkillMetadataBudget,
 ): DescriptionBudgetLine {
-  const minimumLine = renderSkillLineWithDescriptionChars(skill, 0);
+  const minimumLine = renderSkillLineWithDescriptionChars(skill, /*descriptionChars*/ 0);
   const minimumChars = Array.from(minimumLine).length + 1; // +1 for "\n"
   const minimumBytes = byteLength(minimumLine) + 1;
   const minimumCost = budgetCostFromCounts(budget, minimumChars, minimumBytes);
@@ -203,7 +203,7 @@ function renderMinimumUntilBudget(
   let used = 0;
   let omitted = 0;
   for (const skill of skills) {
-    const minimumLine = renderSkillLineWithDescriptionChars(skill, 0);
+    const minimumLine = renderSkillLineWithDescriptionChars(skill, /*descriptionChars*/ 0);
     const cost = lineCost(budget, minimumLine);
     if (used + cost <= budget.limit) {
       used += cost;
@@ -231,7 +231,7 @@ function renderSkillLines(
 
   const minimumCost = skills.reduce(
     (used, skill) =>
-      used + lineCost(budget, renderSkillLineWithDescriptionChars(skill, 0)),
+      used + lineCost(budget, renderSkillLineWithDescriptionChars(skill, /*descriptionChars*/ 0)),
     0,
   );
   if (minimumCost <= budget.limit) {
