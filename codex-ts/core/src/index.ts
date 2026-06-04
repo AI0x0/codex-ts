@@ -7,8 +7,9 @@ export {
   renderSkillsCatalog,
   extractSkillMentions,
   renderSkillInjection,
+  defaultSkillMetadataBudget,
 } from "./skills.js";
-export type { SkillMetadata } from "./skills.js";
+export type { SkillMetadata, SkillMetadataBudget } from "./skills.js";
 export { ToolRouter } from "./tools/router.js";
 export type {
   CustomTool,

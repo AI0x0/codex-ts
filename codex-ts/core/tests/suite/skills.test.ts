@@ -8,6 +8,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CodexThread } from "../../src/codex_thread.js";
 import {
+  defaultSkillMetadataBudget,
   extractSkillMentions,
   renderSkillInjection,
   renderSkillsCatalog,
@@ -188,5 +189,70 @@ describe("skill injection inside a turn", () => {
     await waitForEvent(codex, (m) => m.type === "TurnComplete");
 
     expect(loaded).toEqual([]);
+  });
+});
+
+describe("catalog budget (mirrors render.rs)", () => {
+  const many: SkillMetadata[] = Array.from({ length: 5 }, (_, i) => ({
+    name: `skill-${i}`,
+    description:
+      "A fairly long description that will need trimming when the budget is tight.",
+    path: `.agents/skills/skill-${i}/SKILL.md`,
+  }));
+
+  it("defaultSkillMetadataBudget: 2% tokens with a context window, else 8000 chars", () => {
+    expect(defaultSkillMetadataBudget(128_000)).toEqual({
+      kind: "tokens",
+      limit: 2_560,
+    });
+    expect(defaultSkillMetadataBudget()).toEqual({
+      kind: "characters",
+      limit: 8_000,
+    });
+  });
+
+  it("keeps full descriptions under a generous budget", () => {
+    const out = renderSkillsCatalog(many, {
+      kind: "characters",
+      limit: 100_000,
+    });
+    expect(out).toContain(
+      "A fairly long description that will need trimming when the budget is tight.",
+    );
+    for (let i = 0; i < 5; i += 1) {
+      expect(out).toContain(`skill-${i}`);
+    }
+  });
+
+  it("trims descriptions but keeps every skill when the budget is tight", () => {
+    const out = renderSkillsCatalog(many, { kind: "characters", limit: 350 });
+    for (let i = 0; i < 5; i += 1) {
+      expect(out).toContain(`skill-${i}`);
+    }
+    // The full description no longer fits verbatim.
+    expect(out).not.toContain(
+      "A fairly long description that will need trimming when the budget is tight.",
+    );
+  });
+
+  it("appends truncation warning when descriptions are shortened (mirrors render.rs)", () => {
+    const out = renderSkillsCatalog(many, { kind: "characters", limit: 350 });
+    // At least one description must be shortened → truncation warning appears
+    expect(out).toContain("Skill descriptions were shortened to fit the skills context budget.");
+  });
+
+  it("appends omission warning when skills are dropped (mirrors render.rs)", () => {
+    const out = renderSkillsCatalog(many, { kind: "characters", limit: 80 });
+    const shown = many.filter((skill) => out.includes(skill.name)).length;
+    expect(shown).toBeGreaterThan(0);
+    expect(shown).toBeLessThan(5);
+    // Omission warning must appear
+    expect(out).toContain("not included in the model-visible skills list.");
+  });
+
+  it("no warning when all skills and descriptions fit", () => {
+    const out = renderSkillsCatalog(many, { kind: "characters", limit: 100_000 });
+    expect(out).not.toContain("shortened to fit");
+    expect(out).not.toContain("not included in the model-visible skills list.");
   });
 });

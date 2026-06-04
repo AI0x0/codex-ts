@@ -493,7 +493,7 @@ const thread3 = new CodexThread({ apiKey, model, baseInstructions: "" });
 
 Mirrors the two-layer skill injection in `codex-rs/core-skills/`. Filesystem discovery is the host's responsibility (the browser has no `readdir`); once found, skill metadata is passed in and codex-ts handles the rest.
 
-**Layer 1 — always-on catalog** (mirrors `render.rs`): a `## Skills` section listing every skill by name, description, and path is appended to `instructions` on every turn so the model sees what's available without reading files.
+**Layer 1 — always-on catalog** (mirrors `render.rs`): a `## Skills` section is appended to `instructions` every turn. Descriptions are budget-trimmed to fit within `SkillMetadataBudget` — defaulting to 2% of the model's context window in tokens (or 8 000 characters when the window is unknown). When the budget is exceeded, shorter descriptions or omission warnings are injected automatically, matching codex-rs behaviour exactly.
 
 **Layer 2 — full-body injection** (mirrors `injection.rs`): when the user mentions `$skill-name`, the skill's full `SKILL.md` is loaded via `loadSkillContent` and prepended to that turn's input as a `<skill>` block. Skill bodies are **not** persisted to history — they are turn-scoped context only.
 

@@ -491,7 +491,7 @@ const thread3 = new CodexThread({ apiKey, model, baseInstructions: "" });
 
 照搬 `codex-rs/core-skills/` 的两层技能注入机制。文件系统扫描由 host 负责（浏览器无法读取目录），codex-ts 负责渲染和注入。
 
-**Layer 1 — 常驻目录**（照搬 `render.rs`）：把所有技能的名称、描述、路径渲染为 `## Skills` 章节，拼接在每轮 `instructions` 末尾，让模型始终知道有哪些技能可用。
+**Layer 1 — 常驻目录**（照搬 `render.rs`）：把所有技能的名称、描述、路径渲染为 `## Skills` 章节，拼接在每轮 `instructions` 末尾。描述会按 `SkillMetadataBudget` 预算裁剪，默认为模型上下文窗口的 2%（不知窗口大小时退化为 8 000 字符上限）。当预算不足时自动截短描述或追加遗漏警告，行为与 codex-rs 完全一致。
 
 **Layer 2 — 全文注入**（照搬 `injection.rs`）：用户消息中出现 `$skill-name` 时，通过 `loadSkillContent` 加载对应 `SKILL.md` 全文，以 `<skill>` 块的形式注入当轮输入的最前面。技能全文**不写入历史**——仅对当轮有效。
 
