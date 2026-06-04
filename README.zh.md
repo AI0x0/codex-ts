@@ -536,6 +536,17 @@ git diff 6bcccb0e HEAD -- codex-rs/ext/goal/src/spec.rs
 
 同步完成后将上方哈希替换为新的参照提交。
 
+### 源码注释约定
+
+每个 `.ts` 文件都通过注释标明了与 codex-rs 的关系，同步上游时按此决定是否需要处理：
+
+| 注释 | 含义 | 上游有 diff 时的操作 |
+|---|---|---|
+| `// mirrors codex-rs/path/to/file.rs` | 直接照搬的 TypeScript 翻译 | **检查 diff**，大概率需要同步 |
+| `// mirrors: …`（行内） | 该字段/模式是特定 Rust 构造的 TS 等价物 | 确认对应的 Rust 构造是否变化 |
+| `// Browser-specific extension — no equivalent in codex-rs` | mirror 层之上新增的浏览器扩展，Rust 无对应实现 | **跳过**，上游变更不影响这里 |
+| `// Browser-specific adaptation of …` | 有意裁剪的适配（如 `Op.UserInput` vs `ThreadSettingsOverrides`） | 扫一眼 diff，看是否有值得补充的新字段 |
+
 ### 同步流程
 
 ```bash

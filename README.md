@@ -542,6 +542,18 @@ git diff 6bcccb0e HEAD -- codex-rs/ext/goal/src/spec.rs
 
 Update the hash above to the new reference commit after each sync.
 
+### Source comment conventions
+
+Every `.ts` file that has a non-trivial relationship with codex-rs is annotated
+so you know at a glance whether a diff from upstream requires action:
+
+| Comment in source | Meaning | Action on upstream diff |
+|---|---|---|
+| `// mirrors codex-rs/path/to/file.rs` | Direct TypeScript translation | **Check the diff** — likely needs updating |
+| `// mirrors: …` (inline) | Specific field or pattern is the TS equivalent of a named Rust construct | Check if the Rust construct changed |
+| `// Browser-specific extension — no equivalent in codex-rs` | Added on top of the mirror layer; Rust has nothing analogous | **Skip** — upstream changes don't affect this |
+| `// Browser-specific adaptation of …` | Intentional simplification (e.g. `Op.UserInput` vs `ThreadSettingsOverrides`) | Skim the diff to see if new relevant fields should be ported |
+
 ### File mapping
 
 | Upstream change | codex-ts file to update |
