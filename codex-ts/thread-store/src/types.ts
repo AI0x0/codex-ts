@@ -6,10 +6,21 @@
 import type { EventMsg } from "../../protocol/src/protocol.js";
 
 // ─── ConversationItem (what gets sent to the Responses API) ───────────────────
+//
+// Every variant carries an explicit `type` discriminator, mirroring codex-rs's
+// `ResponseItem` enum (`#[serde(tag = "type", rename_all = "snake_case")]`):
+// message items MUST serialize with `type: "message"` on the wire, exactly like
+// codex-rs. Discriminating user/assistant by `role` alone (omitting `type`) is a
+// silent divergence — strict Responses-API translators that key off `type` will
+// drop these items.
 
 export type ConversationItem =
-  | { role: "user"; content: string | { type: "input_text"; text: string }[] }
-  | { role: "assistant"; content: string }
+  | {
+      type: "message";
+      role: "user";
+      content: string | { type: "input_text"; text: string }[];
+    }
+  | { type: "message"; role: "assistant"; content: string }
   | { type: "function_call"; call_id: string; name: string; arguments: string }
   | { type: "function_call_output"; call_id: string; output: string };
 

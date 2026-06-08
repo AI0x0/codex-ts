@@ -89,7 +89,11 @@ export async function runTurn(
         : null,
     )
     .filter((x): x is { type: "input_text"; text: string } => x !== null);
-  const userMsg: HistoryItem = { role: "user", content: userContent };
+  const userMsg: HistoryItem = {
+    type: "message",
+    role: "user",
+    content: userContent,
+  };
   history.push(userMsg);
   await liveThread?.appendConversationItems([userMsg]);
 
@@ -109,6 +113,7 @@ export async function runTurn(
       const contents = await loadSkillContent(skill).catch(() => null);
       if (contents !== null) {
         skillInjectionItems.push({
+          type: "message",
           role: "user",
           content: [
             { type: "input_text", text: renderSkillInjection(skill, contents) },
@@ -225,7 +230,11 @@ export async function runTurn(
     // ── Persist assistant message ────────────────────────────────────────────
     if (assistantText) {
       lastAgentMessage = assistantText;
-      const assistantItem: HistoryItem = { role: "assistant", content: assistantText };
+      const assistantItem: HistoryItem = {
+        type: "message",
+        role: "assistant",
+        content: assistantText,
+      };
       history.push(assistantItem);
       await liveThread?.appendConversationItems([assistantItem]);
       emitEvent({ type: "AgentMessage", event: { message: assistantText } });

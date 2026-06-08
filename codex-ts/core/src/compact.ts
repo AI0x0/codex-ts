@@ -99,11 +99,19 @@ export function buildCompactedHistory(
 
   const history: ConversationItem[] = [];
   for (const text of selected) {
-    history.push({ role: "user", content: [{ type: "input_text", text }] });
+    history.push({
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text }],
+    });
   }
 
   const finalSummary = summaryText || "(no summary available)";
-  history.push({ role: "user", content: [{ type: "input_text", text: finalSummary }] });
+  history.push({
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text: finalSummary }],
+  });
 
   return history;
 }
@@ -126,7 +134,7 @@ export async function runInlineAutoCompactTask(
   // Build the compaction request: full history + the summarization prompt at the end
   const compactInput: ConversationItem[] = [
     ...history,
-    { role: "user", content: SUMMARIZATION_PROMPT },
+    { type: "message", role: "user", content: SUMMARIZATION_PROMPT },
   ];
 
   const body: Record<string, unknown> = {

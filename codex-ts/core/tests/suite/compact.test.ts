@@ -72,16 +72,20 @@ describe("AutoCompactWindow — BodyAfterPrefix tracking", () => {
 describe("collectUserMessages", () => {
   it("extracts text from user messages", () => {
     const history: ConversationItem[] = [
-      { role: "user", content: "hello" },
-      { role: "assistant", content: "hi" },
-      { role: "user", content: [{ type: "input_text", text: "follow-up" }] },
+      { type: "message", role: "user", content: "hello" },
+      { type: "message", role: "assistant", content: "hi" },
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "follow-up" }],
+      },
     ];
     expect(collectUserMessages(history)).toEqual(["hello", "follow-up"]);
   });
 
   it("skips assistant and tool messages", () => {
     const history: ConversationItem[] = [
-      { role: "assistant", content: "response" },
+      { type: "message", role: "assistant", content: "response" },
       { type: "function_call", call_id: "c1", name: "tool", arguments: "{}" },
     ];
     expect(collectUserMessages(history)).toEqual([]);

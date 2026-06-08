@@ -266,6 +266,7 @@ export class CodexThread {
         // fragment: # AGENTS.md instructions / <INSTRUCTIONS> markers).
         if (this.config.agentsMd) {
           contextItems.push({
+            type: "message",
             role: "user",
             content: [
               {
@@ -279,6 +280,7 @@ export class CodexThread {
         const skillsCatalog = renderSkillsCatalog(this.config.skills);
         if (skillsCatalog) {
           contextItems.push({
+            type: "message",
             role: "user",
             content: [{ type: "input_text", text: skillsCatalog }],
           });
