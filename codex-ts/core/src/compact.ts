@@ -144,7 +144,7 @@ export async function runInlineAutoCompactTask(
   };
   if (config.instructions) body["instructions"] = config.instructions;
 
-  const res = await fetch(`${config.baseUrl}/responses`, {
+  const res = await (config.fetch ?? fetch)(`${config.baseUrl}/responses`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

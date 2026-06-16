@@ -66,6 +66,7 @@ const thread = new CodexThread({
   apiKey: string;
   model: string;
   baseUrl?: string;          // default: https://api.openai.com/v1
+  fetch?: typeof fetch;      // custom fetch for Responses API calls; default: global fetch (use to inject auth headers / token refresh)
   instructions?: string;     // developer instructions (appended after base harness)
   threadId?: string;         // omit to generate; supply to resume
   threadStore?: ThreadStore; // custom persistence store

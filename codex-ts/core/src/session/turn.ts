@@ -32,6 +32,8 @@ type HistoryItem = ConversationItem;
 export interface TurnConfig {
   apiKey: string;
   baseUrl: string;
+  /** Custom fetch for the Responses API call; defaults to the global fetch. */
+  fetch?: typeof fetch | undefined;
   model: string;
   instructions?: string | undefined;
   /** Discovered skills, for `$skill-name` full-body injection (Layer 2). */
@@ -154,7 +156,7 @@ export async function runTurn(
     };
     if (config.instructions) body["instructions"] = config.instructions;
 
-    const res = await fetch(`${config.baseUrl}/responses`, {
+    const res = await (config.fetch ?? fetch)(`${config.baseUrl}/responses`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

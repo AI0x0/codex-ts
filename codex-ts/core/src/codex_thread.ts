@@ -80,6 +80,13 @@ function nextId(): string {
 export interface CodexThreadConfig {
   apiKey: string;
   baseUrl?: string | undefined;
+  /**
+   * Custom `fetch` for the Responses API calls (model sampling + inline
+   * auto-compaction). Defaults to the global `fetch`. Use it to inject auth
+   * headers, refresh a token on 401, route through a proxy, or mock in tests —
+   * without monkey-patching the global `fetch`.
+   */
+  fetch?: typeof fetch | undefined;
   model: string;
   instructions?: string | undefined;
   /**
@@ -150,6 +157,7 @@ export interface CodexThreadConfig {
 interface ResolvedConfig {
   apiKey: string;
   baseUrl: string;
+  fetch: typeof fetch;
   model: string;
   instructions?: string | undefined;
   baseInstructions: string;
@@ -190,6 +198,7 @@ export class CodexThread {
     this.config = {
       apiKey: config.apiKey,
       baseUrl: config.baseUrl ?? "https://api.openai.com/v1",
+      fetch: config.fetch ?? fetch,
       model: config.model,
       instructions: config.instructions,
       baseInstructions: config.baseInstructions ?? DEFAULT_BASE_INSTRUCTIONS,
@@ -288,6 +297,7 @@ export class CodexThread {
         const turnConfig: TurnConfig = {
           apiKey: this.config.apiKey,
           baseUrl: this.config.baseUrl,
+          fetch: this.config.fetch,
           model: op.model ?? this.config.model,
           ...(instructions ? { instructions } : {}),
           ...(contextItems.length > 0 ? { contextItems } : {}),
