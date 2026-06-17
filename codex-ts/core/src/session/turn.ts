@@ -18,7 +18,10 @@ import { extractSkillMentions, renderSkillInjection } from "../skills.js";
 import type { SkillMetadata } from "../skills.js";
 import type { PendingInputs } from "../tools/handlers/request_user_input.js";
 import type { LiveThread } from "../../../thread-store/src/live_thread.js";
-import type { ConversationItem } from "../../../thread-store/src/types.js";
+import type {
+  ConversationItem,
+  UserContentPart,
+} from "../../../thread-store/src/types.js";
 import { parseSseStream } from "./sse.js";
 import { runInlineAutoCompactTask } from "../compact.js";
 import { AutoCompactWindow } from "../state/auto_compact_window.js";
@@ -83,14 +86,17 @@ export async function runTurn(
    *  AbortSignal is the browser-native equivalent. */
   abortSignal?: AbortSignal | undefined,
 ): Promise<{ lastAgentMessage: string }> {
-  // Add user message to history (mutates the shared array)
+  // Add user message to history (mutates the shared array). Mirrors codex-rs:
+  // text → input_text, image → input_image { image_url } (detail left default).
   const userContent = userItems
-    .map((item) =>
+    .map((item): UserContentPart | null =>
       item.type === "text"
-        ? { type: "input_text" as const, text: item.text }
-        : null,
+        ? { type: "input_text", text: item.text }
+        : item.type === "image"
+          ? { type: "input_image", image_url: item.image_url }
+          : null,
     )
-    .filter((x): x is { type: "input_text"; text: string } => x !== null);
+    .filter((x): x is UserContentPart => x !== null);
   const userMsg: HistoryItem = {
     type: "message",
     role: "user",

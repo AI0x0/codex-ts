@@ -13,12 +13,25 @@ import type { EventMsg } from "../../protocol/src/protocol.js";
 // codex-rs. Discriminating user/assistant by `role` alone (omitting `type`) is a
 // silent divergence — strict Responses-API translators that key off `type` will
 // drop these items.
+//
+// User-message content parts mirror codex-rs `ContentItem` (models.rs): text →
+// `input_text`, image → `input_image { image_url, detail? }`. `detail` is omitted
+// for plain user uploads (codex-rs marks it `skip_serializing_if = None`; the
+// server then applies its default), and is kept optional here for the same reason.
+
+/** mirrors codex-rs/protocol/src/models.rs ImageDetail */
+export type ImageDetail = "auto" | "low" | "high" | "original";
+
+/** mirrors codex-rs/protocol/src/models.rs ContentItem (input variants) */
+export type UserContentPart =
+  | { type: "input_text"; text: string }
+  | { type: "input_image"; image_url: string; detail?: ImageDetail };
 
 export type ConversationItem =
   | {
       type: "message";
       role: "user";
-      content: string | { type: "input_text"; text: string }[];
+      content: string | UserContentPart[];
     }
   | { type: "message"; role: "assistant"; content: string }
   | { type: "function_call"; call_id: string; name: string; arguments: string }
