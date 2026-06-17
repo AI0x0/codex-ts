@@ -59,7 +59,7 @@ export function createRequestUserInputTool(): ToolSpec {
 
 /** Normalise args from the model: ensure options exist and set isOther = true */
 export function normalizeRequestUserInputArgs(args: {
-  questions: {
+  questions?: {
     id: string;
     header: string;
     question: string;
@@ -68,6 +68,14 @@ export function normalizeRequestUserInputArgs(args: {
     isSecret?: boolean;
   }[];
 }): { questions: import("../../../../protocol/src/request_user_input.js").RequestUserInputQuestion[] } | { error: string } {
+  // The model can omit `questions` (or send a non-array) under strict:false;
+  // guard before iterating so we return a tool error instead of throwing
+  // "undefined is not an object (evaluating 'args.questions')".
+  if (!Array.isArray(args.questions) || args.questions.length === 0) {
+    return {
+      error: "request_user_input requires a non-empty `questions` array",
+    };
+  }
   for (const q of args.questions) {
     if (!q.options || q.options.length === 0) {
       return {

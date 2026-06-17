@@ -4,6 +4,7 @@
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { CodexThread } from "../../src/codex_thread.js";
+import { normalizeRequestUserInputArgs } from "../../src/tools/handlers/request_user_input_spec.js";
 import type { EventMsg } from "../../../protocol/src/protocol.js";
 import type { RequestUserInputEvent } from "../../../protocol/src/request_user_input.js";
 import {
@@ -214,5 +215,41 @@ describe("request_user_input missing options rejects", () => {
     expect(toolOutput).toBeDefined();
     const parsed = JSON.parse(toolOutput!.output ?? "{}") as { error: string };
     expect(parsed.error).toMatch(/non-empty options/);
+  });
+});
+
+describe("normalizeRequestUserInputArgs guards a malformed questions field", () => {
+  // Under strict:false the model can call request_user_input without a
+  // `questions` array; normalize must return a tool error, never throw
+  // "undefined is not an object (evaluating 'args.questions')".
+  it("returns an error when questions is missing", () => {
+    const result = normalizeRequestUserInputArgs({} as never);
+    expect("error" in result).toBe(true);
+  });
+
+  it("returns an error when questions is not an array", () => {
+    const result = normalizeRequestUserInputArgs({
+      questions: "nope",
+    } as never);
+    expect("error" in result).toBe(true);
+  });
+
+  it("returns an error when questions is empty", () => {
+    const result = normalizeRequestUserInputArgs({ questions: [] });
+    expect("error" in result).toBe(true);
+  });
+
+  it("normalizes a valid question and sets isOther = true", () => {
+    const result = normalizeRequestUserInputArgs({
+      questions: [
+        {
+          id: "q1",
+          header: "Q",
+          question: "Pick?",
+          options: [{ label: "A", description: "a" }],
+        },
+      ],
+    });
+    expect("questions" in result && result.questions[0]?.isOther).toBe(true);
   });
 });
