@@ -1,6 +1,6 @@
 {
   "name": "@ai0x0/codex-ts",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "type": "module",
   "license": "Apache-2.0",
   "exports": {

@@ -23,6 +23,14 @@ import type {
   UserContentPart,
 } from "../../../thread-store/src/types.js";
 import { parseSseStream } from "./sse.js";
+import {
+  computeRetryDelay,
+  DEFAULT_MAX_RETRIES,
+  isRetryableError,
+  parseRetryAfter,
+  ResponsesApiError,
+  sleep,
+} from "./retry.js";
 import { runInlineAutoCompactTask } from "../compact.js";
 import { AutoCompactWindow } from "../state/auto_compact_window.js";
 
@@ -56,6 +64,14 @@ export interface TurnConfig {
    * Omit to disable auto-compaction.
    */
   autoCompactTokenLimit?: number | undefined;
+  /**
+   * Max retries for transient Responses request/stream failures — network
+   * errors, 5xx / 408 / 409 / 429, or a stream dropped before any visible
+   * output. Each retry waits an exponential backoff (200ms × 2^(n-1) ± 10%
+   * jitter), honoring a server Retry-After when present. mirrors codex-rs
+   * stream/request_max_retries. Defaults to DEFAULT_MAX_RETRIES (5).
+   */
+  maxRetries?: number | undefined;
   /**
    * Turn-scoped context messages prepended to `input` ahead of history,
    * mirroring codex-rs's contextual user fragments: user_instructions
@@ -132,6 +148,7 @@ export async function runTurn(
   }
 
   const tools = router.toolSpecs().map(toolSpecToRequestJson);
+  const maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES;
   let lastAgentMessage = "";
   let itemIdCounter = 0;
 
@@ -162,76 +179,128 @@ export async function runTurn(
     };
     if (config.instructions) body["instructions"] = config.instructions;
 
-    const res = await (config.fetch ?? fetch)(`${config.baseUrl}/responses`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${config.apiKey}`,
-      },
-      body: JSON.stringify(body),
-      signal: abortSignal ?? null,
-    });
-
-    if (!res.ok || !res.body) {
-      const text = res.body ? await res.text() : "(no body)";
-      throw new Error(`Responses API ${res.status}: ${text}`);
-    }
-
-    // ── Parse SSE stream ────────────────────────────────────────────────────
+    // ── Sample from the model (retry transient failures) ────────────────────
+    // mirrors codex-rs's stream retry loop (responses_retry.rs): a network
+    // error / 5xx / 429 / dropped stream is retried with exponential backoff.
+    // Unlike codex-rs (which re-streams in place into a TUI) codex-ts emits
+    // deltas live, so we only retry while NO visible output has streamed yet —
+    // re-streaming after that would duplicate text downstream.
     const functionCalls: { call_id: string; name: string; arguments: string }[] =
       [];
     const partialArgs = new Map<string, { name: string; args: string }>();
     let assistantText = "";
     let currentItemId = `item-${++itemIdCounter}`;
     let inputTokensThisRound = 0;
+    let retryAttempt = 0;
 
-    for await (const raw of parseSseStream(res.body)) {
-      switch (raw["type"]) {
-        case "response.output_item.added": {
-          const item = raw["item"] as Record<string, unknown> | undefined;
-          if (item?.["type"] === "function_call") {
-            const cid = String(item["call_id"]);
-            partialArgs.set(cid, { name: String(item["name"]), args: "" });
-          } else if (item?.["type"] === "message") {
-            currentItemId = String(item["id"] ?? currentItemId);
+    for (;;) {
+      // A retry re-streams from scratch → reset per-attempt accumulators.
+      functionCalls.length = 0;
+      partialArgs.clear();
+      assistantText = "";
+      currentItemId = `item-${++itemIdCounter}`;
+      inputTokensThisRound = 0;
+      let emittedOutput = false;
+
+      try {
+        const res = await (config.fetch ?? fetch)(
+          `${config.baseUrl}/responses`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${config.apiKey}`,
+            },
+            body: JSON.stringify(body),
+            signal: abortSignal ?? null,
+          },
+        );
+
+        if (!res.ok || !res.body) {
+          const text = res.body ? await res.text() : "(no body)";
+          throw new ResponsesApiError(
+            res.status,
+            text,
+            parseRetryAfter(res.headers),
+          );
+        }
+
+        // ── Parse SSE stream ──────────────────────────────────────────────
+        for await (const raw of parseSseStream(res.body)) {
+          switch (raw["type"]) {
+            case "response.output_item.added": {
+              const item = raw["item"] as Record<string, unknown> | undefined;
+              if (item?.["type"] === "function_call") {
+                const cid = String(item["call_id"]);
+                partialArgs.set(cid, { name: String(item["name"]), args: "" });
+              } else if (item?.["type"] === "message") {
+                currentItemId = String(item["id"] ?? currentItemId);
+              }
+              break;
+            }
+            case "response.output_text.delta": {
+              const delta = String(raw["delta"] ?? "");
+              assistantText += delta;
+              // Visible output has streamed — past this point a retry would
+              // duplicate text, so failures below are no longer retryable.
+              emittedOutput = true;
+              emitEvent({
+                type: "AgentMessageContentDelta",
+                event: { turn_id: turnId, item_id: currentItemId, delta },
+              });
+              break;
+            }
+            case "response.function_call_arguments.delta": {
+              const partial = partialArgs.get(String(raw["call_id"] ?? ""));
+              if (partial) partial.args += String(raw["delta"] ?? "");
+              break;
+            }
+            case "response.output_item.done": {
+              const item = raw["item"] as Record<string, unknown> | undefined;
+              if (item?.["type"] === "function_call") {
+                functionCalls.push({
+                  call_id: String(item["call_id"]),
+                  name: String(item["name"]),
+                  arguments: String(item["arguments"] ?? "{}"),
+                });
+              }
+              break;
+            }
+            case "response.done": {
+              // mirrors ensure_server_observed_prefill_from_usage in auto_compact_window.rs
+              const resp = raw["response"] as
+                | Record<string, unknown>
+                | undefined;
+              const usage = resp?.["usage"] as
+                | Record<string, unknown>
+                | undefined;
+              if (typeof usage?.["input_tokens"] === "number") {
+                inputTokensThisRound = usage["input_tokens"];
+                compactWindow.ensureServerObservedPrefill(inputTokensThisRound);
+              }
+              break;
+            }
           }
-          break;
         }
-        case "response.output_text.delta": {
-          const delta = String(raw["delta"] ?? "");
-          assistantText += delta;
-          emitEvent({
-            type: "AgentMessageContentDelta",
-            event: { turn_id: turnId, item_id: currentItemId, delta },
-          });
-          break;
+        break; // stream consumed successfully → leave the retry loop
+      } catch (err) {
+        // An interrupt is terminal — never retry past a cancellation.
+        if (abortSignal?.aborted) throw err;
+        // Stop retrying once visible output streamed (would duplicate), the
+        // budget is spent, or the error is not transient.
+        if (
+          emittedOutput ||
+          retryAttempt >= maxRetries ||
+          !isRetryableError(err)
+        ) {
+          throw err;
         }
-        case "response.function_call_arguments.delta": {
-          const partial = partialArgs.get(String(raw["call_id"] ?? ""));
-          if (partial) partial.args += String(raw["delta"] ?? "");
-          break;
-        }
-        case "response.output_item.done": {
-          const item = raw["item"] as Record<string, unknown> | undefined;
-          if (item?.["type"] === "function_call") {
-            functionCalls.push({
-              call_id: String(item["call_id"]),
-              name: String(item["name"]),
-              arguments: String(item["arguments"] ?? "{}"),
-            });
-          }
-          break;
-        }
-        case "response.done": {
-          // mirrors ensure_server_observed_prefill_from_usage in auto_compact_window.rs
-          const resp = raw["response"] as Record<string, unknown> | undefined;
-          const usage = resp?.["usage"] as Record<string, unknown> | undefined;
-          if (typeof usage?.["input_tokens"] === "number") {
-            inputTokensThisRound = usage["input_tokens"];
-            compactWindow.ensureServerObservedPrefill(inputTokensThisRound);
-          }
-          break;
-        }
+        retryAttempt += 1;
+        emitEvent({
+          type: "Warning",
+          event: { message: `Reconnecting... ${retryAttempt}/${maxRetries}` },
+        });
+        await sleep(computeRetryDelay(err, retryAttempt), abortSignal);
       }
     }
 

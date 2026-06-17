@@ -152,6 +152,14 @@ export interface CodexThreadConfig {
    * Omit to disable auto-compaction entirely.
    */
   autoCompactTokenLimit?: number | undefined;
+  /**
+   * Max retries for transient Responses request/stream failures — network
+   * errors, 5xx / 408 / 409 / 429, or a stream dropped before any visible
+   * output. Each retry waits an exponential backoff (200ms × 2^(n-1) ± 10%
+   * jitter), honoring a server Retry-After when present. mirrors codex-rs
+   * stream/request_max_retries. Defaults to 5; pass 0 to disable retries.
+   */
+  maxRetries?: number | undefined;
 }
 
 interface ResolvedConfig {
@@ -165,6 +173,7 @@ interface ResolvedConfig {
   loadSkillContent?: ((skill: SkillMetadata) => Promise<string>) | undefined;
   agentsMd?: string | undefined;
   autoCompactTokenLimit?: number | undefined;
+  maxRetries?: number | undefined;
 }
 
 // ─── CodexThread ─────────────────────────────────────────────────────────────
@@ -206,6 +215,7 @@ export class CodexThread {
       loadSkillContent: config.loadSkillContent,
       agentsMd: config.agentsMd,
       autoCompactTokenLimit: config.autoCompactTokenLimit,
+      maxRetries: config.maxRetries,
     };
 
     this.threadId = config.threadId ?? nextId();
@@ -309,6 +319,9 @@ export class CodexThread {
             : {}),
           ...(this.config.autoCompactTokenLimit !== undefined
             ? { autoCompactTokenLimit: this.config.autoCompactTokenLimit }
+            : {}),
+          ...(this.config.maxRetries !== undefined
+            ? { maxRetries: this.config.maxRetries }
             : {}),
         };
 
