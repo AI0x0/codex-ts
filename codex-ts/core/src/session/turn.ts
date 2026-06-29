@@ -46,6 +46,11 @@ export interface TurnConfig {
   /** Custom fetch for the Responses API call; defaults to the global fetch. */
   fetch?: typeof fetch | undefined;
   model: string;
+  /** Reasoning effort for the Responses API. codeproxy maps `reasoning.effort`
+   *  to the upstream thinking budget — REQUIRED for Gemini to stream reasoning
+   *  (thought) deltas (surfaced as ReasoningContentDelta). Defaults to "medium"
+   *  when omitted. */
+  reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh" | undefined;
   instructions?: string | undefined;
   /** Discovered skills, for `$skill-name` full-body injection (Layer 2). */
   skills?: SkillMetadata[] | undefined;
@@ -166,6 +171,10 @@ export async function runTurn(
     // ── Sample from the model ───────────────────────────────────────────────
     const body: Record<string, unknown> = {
       model: config.model,
+      // Reasoning: codeproxy maps `reasoning.effort` → upstream thinking budget so
+      // Gemini streams reasoning (thought) deltas → ReasoningContentDelta. Without
+      // it the model never emits thinking (only output text). Defaults to "medium".
+      reasoning: { effort: config.reasoningEffort ?? "medium" },
       // codex-rs structure: turn-scoped context (user_instructions + skills
       // catalog) and any $mention skill bodies ride at the front, ahead of the
       // persisted conversation history. None of these are persisted.
