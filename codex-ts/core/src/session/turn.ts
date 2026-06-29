@@ -106,25 +106,37 @@ export async function runTurn(
   /** mirrors: codex-rs propagates a tokio CancellationToken into the turn loop;
    *  AbortSignal is the browser-native equivalent. */
   abortSignal?: AbortSignal | undefined,
+  /** Additional SEPARATE user messages to record alongside `userItems` in this
+   *  one turn — each entry is one message's content items and becomes its own
+   *  role:user history item, never merged. Mirrors codex-rs draining several
+   *  queued UserInput submissions into the turn as distinct messages (so the
+   *  app can flush a whole send-queue as one turn: "send all queued, not
+   *  merged into one message"). */
+  extraUserMessages?: UserInput[][] | undefined,
 ): Promise<{ lastAgentMessage: string }> {
-  // Add user message to history (mutates the shared array). Mirrors codex-rs:
-  // text → input_text, image → input_image { image_url } (detail left default).
-  const userContent = userItems
-    .map((item): UserContentPart | null =>
-      item.type === "text"
-        ? { type: "input_text", text: item.text }
-        : item.type === "image"
-          ? { type: "input_image", image_url: item.image_url }
-          : null,
-    )
-    .filter((x): x is UserContentPart => x !== null);
-  const userMsg: HistoryItem = {
-    type: "message",
-    role: "user",
-    content: userContent,
-  };
-  history.push(userMsg);
-  await liveThread?.appendConversationItems([userMsg]);
+  // Record one user message per submitted group, in order (mutates the shared
+  // history array). codex-rs records each queued UserInput submission as its OWN
+  // role:user item and never merges them; we mirror that by recording `userItems`
+  // (the primary message) followed by each `extraUserMessages` entry as a separate
+  // message. text → input_text, image → input_image { image_url } (detail default).
+  const toUserContent = (items: UserInput[]): UserContentPart[] =>
+    items
+      .map((item): UserContentPart | null =>
+        item.type === "text"
+          ? { type: "input_text", text: item.text }
+          : item.type === "image"
+            ? { type: "input_image", image_url: item.image_url }
+            : null,
+      )
+      .filter((part): part is UserContentPart => part !== null);
+  const userMsgs: HistoryItem[] = [userItems, ...(extraUserMessages ?? [])]
+    .map(toUserContent)
+    .filter((content) => content.length > 0)
+    .map((content) => ({ type: "message", role: "user", content }));
+  history.push(...userMsgs);
+  if (userMsgs.length > 0) {
+    await liveThread?.appendConversationItems(userMsgs);
+  }
 
   // ── Layer 2: turn-scoped skill full-body injection (mirrors codex-rs) ──────
   // A `$skill-name` mention in user input pulls that skill's full SKILL.md into
@@ -134,7 +146,8 @@ export async function runTurn(
   const skillInjectionItems: HistoryItem[] = [];
   const loadSkillContent = config.loadSkillContent;
   if (config.skills && config.skills.length > 0 && loadSkillContent) {
-    const userText = userItems
+    const userText = [userItems, ...(extraUserMessages ?? [])]
+      .flat()
       .map((item) => (item.type === "text" ? item.text : ""))
       .join("\n");
     const mentioned = extractSkillMentions(userText, config.skills);

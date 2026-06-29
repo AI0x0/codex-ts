@@ -343,6 +343,7 @@ export class CodexThread {
           (msg: EventMsg) => this.pushEvent(submissionId, msg),
           this.liveThread,        // ← persistence hook
           abortController.signal, // ← interrupt hook
+          op.extraUserMessages,   // ← additional separate user messages (queue flush)
         )
           .then(({ lastAgentMessage }) => {
             this.pushEvent(submissionId, {

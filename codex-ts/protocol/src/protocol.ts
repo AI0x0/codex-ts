@@ -127,6 +127,16 @@ export type Op =
       type: "UserInput";
       items: UserInput[];
       /**
+       * Additional SEPARATE user messages to record alongside `items` in this one
+       * turn — each entry is one message's content items and becomes its own
+       * role:user history item, never merged into `items`. Mirrors codex-rs
+       * draining several queued UserInput submissions into the turn as distinct
+       * messages, so the app can flush a whole send-queue in one turn ("send all
+       * queued at once, not merged into a single message"). Omitted = single
+       * message, identical to before.
+       */
+      extraUserMessages?: UserInput[][] | undefined;
+      /**
        * Per-turn instructions override. Subset of ThreadSettingsOverrides in
        * codex-rs. Falls back to the thread's instructions when omitted.
        */
