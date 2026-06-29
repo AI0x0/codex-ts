@@ -53,6 +53,14 @@ export interface AgentMessageContentDeltaEvent {
   delta: string;
 }
 
+/** Streaming reasoning (thinking) chunk — mirrors codex-rs ReasoningContentDeltaEvent.
+ *  Emitted while the model streams its reasoning/thinking, before any final
+ *  output_text. Lets hosts show a "thinking" state only while truly reasoning. */
+export interface ReasoningContentDeltaEvent {
+  turn_id: string;
+  delta: string;
+}
+
 export interface ThreadGoalUpdatedEvent {
   turn_id?: string | undefined;
   goal: ThreadGoal;
@@ -83,6 +91,7 @@ export type EventMsg =
   | { type: "TurnComplete"; event: TurnCompleteEvent }
   | { type: "AgentMessage"; event: AgentMessageEvent }
   | { type: "AgentMessageContentDelta"; event: AgentMessageContentDeltaEvent }
+  | { type: "ReasoningContentDelta"; event: ReasoningContentDeltaEvent }
   | { type: "RequestUserInput"; event: RequestUserInputEvent }
   | { type: "ThreadGoalUpdated"; event: ThreadGoalUpdatedEvent }
   | { type: "PlanUpdate"; event: UpdatePlanArgs }

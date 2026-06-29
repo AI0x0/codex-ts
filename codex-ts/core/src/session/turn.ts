@@ -250,6 +250,19 @@ export async function runTurn(
               });
               break;
             }
+            case "response.reasoning_text.delta":
+            case "response.reasoning_summary_text.delta": {
+              // 模型正在产出 reasoning（thinking）——照搬 codex-rs
+              // codex-api/src/sse/responses.rs 的 reasoning delta 分支。供 host 在模型
+              // "真正 thinking"（而非仅已发请求未回）时显示 Thinking。Gemini 的 thinking
+              // 经 codeproxy 翻译为 responses reasoning，正是从这两个 SSE 事件流出。
+              const delta = String(raw["delta"] ?? "");
+              emitEvent({
+                type: "ReasoningContentDelta",
+                event: { turn_id: turnId, delta },
+              });
+              break;
+            }
             case "response.function_call_arguments.delta": {
               const partial = partialArgs.get(String(raw["call_id"] ?? ""));
               if (partial) partial.args += String(raw["delta"] ?? "");
