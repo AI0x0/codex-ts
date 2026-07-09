@@ -301,8 +301,12 @@ export async function runTurn(
               }
               break;
             }
-            case "response.done": {
-              // mirrors ensure_server_observed_prefill_from_usage in auto_compact_window.rs
+            case "response.completed": {
+              // Terminal event of the OpenAI Responses stream — codex-rs dispatches
+              // the same "response.completed" (codex-api/src/sse/responses.rs) to read
+              // usage. (An earlier port used "response.done", which no Responses
+              // backend emits, so usage never arrived and auto-compaction never armed.)
+              // Mirrors ensure_server_observed_prefill_from_usage in auto_compact_window.rs
               const resp = raw["response"] as
                 | Record<string, unknown>
                 | undefined;

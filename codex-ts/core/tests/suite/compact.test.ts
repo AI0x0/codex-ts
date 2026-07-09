@@ -116,7 +116,7 @@ describe("mid-turn auto-compaction", () => {
     return sseFlat([
       ...items,
       {
-        type: "response.done",
+        type: "response.completed",
         response: {
           id: "resp",
           status: "completed",

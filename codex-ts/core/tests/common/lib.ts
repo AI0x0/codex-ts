@@ -99,7 +99,7 @@ export function evAssistantMessage(text: string): object {
 }
 
 export function evCompleted(id: string): object {
-  return { type: "response.done", response: { id, status: "completed" } };
+  return { type: "response.completed", response: { id, status: "completed" } };
 }
 
 /** Flatten nested arrays of SSE events into a single SSE string */
