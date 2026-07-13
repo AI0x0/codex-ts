@@ -70,6 +70,17 @@ export interface TurnConfig {
    */
   autoCompactTokenLimit?: number | undefined;
   /**
+   * Session-scoped compaction window. The thread owns ONE instance and threads it
+   * through every runTurn so BodyAfterPrefix measures context growth ACROSS turns
+   * (mirrors codex-rs, where the window lives in session state, read via
+   * n_snapshot). Omit → a fresh per-turn window (growth measured only within the
+   * turn) — fine for one-shot direct calls / tests. A multi-turn interactive thread
+   * MUST pass a shared instance, otherwise cross-turn accumulation never counts
+   * toward the limit, compaction never fires, and the context grows past the
+   * model's window → "prompt is too long".
+   */
+  compactWindow?: AutoCompactWindow | undefined;
+  /**
    * Max retries for transient Responses request/stream failures — network
    * errors, 5xx / 408 / 409 / 429, or a stream dropped before any visible
    * output. Each retry waits an exponential backoff (200ms × 2^(n-1) ± 10%
@@ -173,7 +184,14 @@ export async function runTurn(
   // ── Auto-compaction window tracker (mirrors AutoCompactWindow in codex-rs) ──
   // Uses BodyAfterPrefix mode: only tokens added after the last compaction count
   // toward the limit. mirrors AutoCompactTokenLimitScope::BodyAfterPrefix.
-  const compactWindow = new AutoCompactWindow();
+  //
+  // Prefer the THREAD-OWNED window (config.compactWindow) so the baseline persists
+  // ACROSS turns — codex-rs keeps this in session state. A fresh window per turn
+  // would reset the baseline to the (already large) current size every turn, so
+  // cross-turn growth never reaches the limit and a long interactive thread
+  // silently grows past the model's context window → "prompt is too long". Fall
+  // back to a private window only when no shared one is supplied (one-shot/tests).
+  const compactWindow = config.compactWindow ?? new AutoCompactWindow();
 
   for (;;) {
     // Bail out before sampling again if the turn was interrupted.

@@ -245,3 +245,109 @@ describe("mid-turn auto-compaction", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
+
+// ─── Integration: cross-turn compaction (thread-owned window) ──────────────────
+// Regression for the per-turn-window bug: the compaction baseline must PERSIST
+// across turns (codex-rs keeps it in session state, read via n_snapshot). A fresh
+// AutoCompactWindow per runTurn reset the baseline to the current (already large)
+// size every turn, so cross-turn growth never reached the limit — compaction never
+// fired and long interactive threads grew past the model's context window → 400.
+
+describe("cross-turn auto-compaction (thread-owned window)", () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function sseWithUsage(inputTokens: number, items: object[]) {
+    return sseFlat([
+      ...items,
+      {
+        type: "response.completed",
+        response: {
+          id: "resp",
+          status: "completed",
+          usage: {
+            input_tokens: inputTokens,
+            output_tokens: 10,
+            total_tokens: inputTokens + 10,
+          },
+        },
+      },
+    ]);
+  }
+
+  it("compacts on growth accumulated ACROSS turns (baseline persists)", async () => {
+    const fetchMock = vi.fn();
+
+    // Turn 1 — plain reply, usage 1000 → sets the thread window baseline to 1000.
+    fetchMock.mockResolvedValueOnce(
+      makeSseResponse(
+        sseWithUsage(1000, [evResponseCreated("t1"), evAssistantMessage("ok")]),
+      ),
+    );
+
+    // Turn 2 round 1 — tool call, usage 2000. With a PERSISTENT baseline (1000)
+    // growth = 2000 - 1000 = 1000 ≥ 900 → compact. (A per-turn window would reset
+    // the baseline to 2000 here → growth 0 → NO compaction — the bug.)
+    fetchMock.mockResolvedValueOnce(
+      makeSseResponse(
+        sseWithUsage(2000, [
+          evResponseCreated("t2-r1"),
+          evFunctionCall("call-1", "get_goal", {}),
+        ]),
+      ),
+    );
+
+    // Compaction request → summary.
+    fetchMock.mockResolvedValueOnce(
+      makeSseResponse(
+        sseFlat([
+          evResponseCreated("t2-compact"),
+          evAssistantMessage("summary text"),
+          evCompleted("t2-compact"),
+        ]),
+      ),
+    );
+
+    // Turn 2 round 2 — after get_goal is dispatched, final reply.
+    fetchMock.mockResolvedValueOnce(
+      makeSseResponse(
+        sseFlat([
+          evResponseCreated("t2-r2"),
+          evAssistantMessage("done"),
+          evCompleted("t2-r2"),
+        ]),
+      ),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const codex = new CodexThread({
+      apiKey: "test",
+      model: "gpt-4o",
+      autoCompactTokenLimit: 900,
+    });
+
+    // Turn 1 — establishes the baseline, no compaction.
+    await codex.submit({
+      type: "UserInput",
+      items: [{ type: "text", text: "hi" }],
+    });
+    await waitForEvent(codex, (msg) => msg.type === "TurnComplete");
+
+    // Turn 2 — cross-turn growth (1000→2000) must trigger compaction.
+    await codex.submit({
+      type: "UserInput",
+      items: [{ type: "text", text: "again" }],
+    });
+    const compacted = await waitForEvent(
+      codex,
+      (msg) => msg.type === "ContextCompacted",
+    );
+    expect(compacted.type).toBe("ContextCompacted");
+    await waitForEvent(codex, (msg) => msg.type === "TurnComplete");
+
+    // Turn1(1) + Turn2 round1(1) + compaction(1) + Turn2 round2(1) = 4.
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+});

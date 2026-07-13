@@ -29,6 +29,7 @@ import type { ConversationItem } from "../../thread-store/src/types.js";
 import { ToolRouter } from "./tools/router.js";
 import type { CustomTool } from "./tools/router.js";
 import { runTurn } from "./session/turn.js";
+import { AutoCompactWindow } from "./state/auto_compact_window.js";
 import { DEFAULT_BASE_INSTRUCTIONS } from "./base_instructions.js";
 import { renderSkillsCatalog } from "./skills.js";
 import type { SkillMetadata } from "./skills.js";
@@ -201,6 +202,10 @@ export class CodexThread {
    * mirrors: codex-rs uses a tokio CancellationToken propagated from
    * Op::Interrupt; AbortController is the browser-native equivalent.
    */
+  // Session-scoped compaction window — ONE per thread, threaded into every
+  // runTurn so auto-compaction measures context growth across turns, not just
+  // within a turn (mirrors codex-rs session state). See TurnConfig.compactWindow.
+  private readonly compactWindow = new AutoCompactWindow();
   private currentTurnAbort: AbortController | null = null;
 
   constructor(config: CodexThreadConfig) {
@@ -309,6 +314,7 @@ export class CodexThread {
           baseUrl: this.config.baseUrl,
           fetch: this.config.fetch,
           model: op.model ?? this.config.model,
+          compactWindow: this.compactWindow,
           ...(instructions ? { instructions } : {}),
           ...(contextItems.length > 0 ? { contextItems } : {}),
           ...(this.config.skills.length > 0
