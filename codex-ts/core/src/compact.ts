@@ -19,6 +19,7 @@ import {
   ResponsesApiError,
   sleep,
 } from "./session/retry.js";
+import { normalizeHistory, removeCorrespondingFor } from "./normalize.js";
 
 // ─── Prompt constants (verbatim from codex-rs templates) ──────────────────────
 
@@ -146,7 +147,10 @@ export async function runInlineAutoCompactTask(
   // keep the prefix cache and the recent messages intact). The replacement
   // history below is still built from the ORIGINAL `history` (mirrors rs,
   // which collects user messages from the untrimmed session history).
-  let summarizerInput: ConversationItem[] = [...history];
+  // Same pairing invariants as a sampling request (mirrors for_prompt →
+  // normalize_history) — Anthropic 400s on unpaired tool_use/tool_result.
+  const summarizerInput: ConversationItem[] = [...history];
+  normalizeHistory(summarizerInput);
   const maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES;
   let retries = 0;
   let summaryText = "";
@@ -203,8 +207,11 @@ export async function runInlineAutoCompactTask(
     } catch (err) {
       if (isContextWindowExceededError(err)) {
         if (summarizerInput.length > 1) {
-          // mirrors compact.rs:233-240: drop the oldest item and try again.
-          summarizerInput = summarizerInput.slice(1);
+          // mirrors compact.rs:233-240 + history.remove_first_item: drop the
+          // oldest item AND its call/output counterpart (pairing stays intact),
+          // then try again.
+          const removed = summarizerInput.shift();
+          if (removed) removeCorrespondingFor(summarizerInput, removed);
           retries = 0;
           continue;
         }

@@ -11,6 +11,12 @@ export {
   isContextWindowExceededText,
   ResponsesApiError,
 } from "./session/retry.js";
+export {
+  ensureCallOutputsPresent,
+  normalizeHistory,
+  removeCorrespondingFor,
+  removeOrphanOutputs,
+} from "./normalize.js";
 export type { CodexThreadConfig } from "./codex_thread.js";
 export { DEFAULT_BASE_INSTRUCTIONS } from "./base_instructions.js";
 export {

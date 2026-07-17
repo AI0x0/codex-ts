@@ -33,6 +33,7 @@ import {
   sleep,
 } from "./retry.js";
 import { runInlineAutoCompactTask } from "../compact.js";
+import { normalizeHistory } from "../normalize.js";
 import { AutoCompactWindow } from "../state/auto_compact_window.js";
 import {
   approxTokenCount,
@@ -318,6 +319,12 @@ export async function runTurn(
       throw new DOMException("Turn interrupted", "AbortError");
     }
 
+    // ── Pairing invariants before every request (mirrors for_prompt →
+    // normalize_history): synthesize "aborted" outputs for calls that never
+    // got one (interrupted turn, resumed corrupted thread) and drop orphaned
+    // outputs. Anthropic 400s on unpaired tool_use/tool_result otherwise.
+    normalizeHistory(history);
+
     // ── Sample from the model ───────────────────────────────────────────────
     const body: Record<string, unknown> = {
       model: config.model,
@@ -543,24 +550,6 @@ export async function runTurn(
     // ── Done when no tool calls ─────────────────────────────────────────────
     if (functionCalls.length === 0) break;
 
-    // ── Auto-compaction check (mirrors post-sampling compact, turn.rs:266-292) ─
-    // Only triggered mid-turn (when there are more tool calls to dispatch),
-    // matching `token_limit_reached && needs_follow_up` in codex-rs. Fires on
-    // EITHER growth-since-baseline ≥ autoCompactTokenLimit OR total active
-    // context ≥ contextWindow (see autoCompactTokenStatus).
-    {
-      const status = autoCompactTokenStatus(config, compactWindow, tokenState);
-      if (status.tokenLimitReached) {
-        await runCompactAndRecompute(
-          history,
-          config,
-          compactWindow,
-          tokenState,
-          emitEvent,
-        );
-      }
-    }
-
     // ── Dispatch tool calls ─────────────────────────────────────────────────
     for (const call of functionCalls) {
       let args: unknown;
@@ -583,6 +572,28 @@ export async function runTurn(
       };
       history.push(outputItem);
       await liveThread?.appendConversationItems([outputItem]);
+    }
+
+    // ── Auto-compaction check (mirrors post-sampling compact, turn.rs:266-292) ─
+    // Only triggered mid-turn (more sampling rounds follow), matching
+    // `token_limit_reached && needs_follow_up` in codex-rs. Runs AFTER the tool
+    // outputs are recorded — codex-rs compacts only between COMPLETE rounds; an
+    // earlier port compacted between call-recording and dispatch, so the
+    // rewrite dropped the pending function_calls and the outputs pushed right
+    // after became orphans → Anthropic 400 "tool_use ids … without tool_result".
+    // Fires on EITHER growth-since-baseline ≥ autoCompactTokenLimit OR total
+    // active context ≥ contextWindow (see autoCompactTokenStatus).
+    {
+      const status = autoCompactTokenStatus(config, compactWindow, tokenState);
+      if (status.tokenLimitReached) {
+        await runCompactAndRecompute(
+          history,
+          config,
+          compactWindow,
+          tokenState,
+          emitEvent,
+        );
+      }
     }
   }
 
