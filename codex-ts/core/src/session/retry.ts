@@ -56,6 +56,39 @@ export function isRetryableStatus(status: number): boolean {
   return status === 408 || status === 409 || status === 429 || status >= 500;
 }
 
+// mirrors codex-api/src/sse/responses.rs is_context_window_error — codex-rs only
+// needs the OpenAI canonical `code: "context_length_exceeded"`, because its
+// upstream speaks pure OpenAI. codex-ts rides OpenRouter/codeproxy, whose error
+// bodies wrap the ORIGINAL provider error verbatim (`metadata.raw`), so the
+// canonical code rarely survives — match each provider's wording too:
+//   - OpenAI:            "context_length_exceeded" / "exceeds the context window"
+//   - Anthropic/Bedrock: "prompt is too long: N tokens > M maximum"
+//   - Gemini:            "input token count ... exceeds the maximum"
+const CONTEXT_WINDOW_ERROR_RE =
+  /context_length_exceeded|exceeds the context window|prompt is too long|exceeds the maximum number of tokens|input token count .{0,40}exceeds/iu;
+
+/** Message-level probe — rs classifies purely by the error payload (its
+ *  canonical `code`), never by HTTP status; SSE `response.failed` has no
+ *  status at all. Exposed for both the turn loop and the compaction task. */
+export function isContextWindowExceededText(text: string): boolean {
+  return CONTEXT_WINDOW_ERROR_RE.test(text);
+}
+
+/**
+ * Classify a terminal request failure as context-window-exceeded.
+ * mirrors CodexErr::ContextWindowExceeded classification: turn.ts marks the
+ * session tokens FULL on this error so the next turn compacts before sampling
+ * (turn.rs:1045-1047), and compact.ts trims the oldest history item and
+ * retries (compact.rs:232-241). Callers must check this BEFORE the retry
+ * decision — the same request would fail again.
+ */
+export function isContextWindowExceededError(error: unknown): boolean {
+  return (
+    error instanceof ResponsesApiError &&
+    isContextWindowExceededText(error.message)
+  );
+}
+
 /**
  * Classify a thrown error as retryable. Aborts (interrupts) are terminal;
  * ResponsesApiError defers to its status; anything else (network TypeError,

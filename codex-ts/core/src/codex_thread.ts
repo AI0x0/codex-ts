@@ -30,6 +30,7 @@ import { ToolRouter } from "./tools/router.js";
 import type { CustomTool } from "./tools/router.js";
 import { runTurn } from "./session/turn.js";
 import { AutoCompactWindow } from "./state/auto_compact_window.js";
+import { SessionTokenState } from "./state/token_state.js";
 import { DEFAULT_BASE_INSTRUCTIONS } from "./base_instructions.js";
 import { renderSkillsCatalog } from "./skills.js";
 import type { SkillMetadata } from "./skills.js";
@@ -154,6 +155,16 @@ export interface CodexThreadConfig {
    */
   autoCompactTokenLimit?: number | undefined;
   /**
+   * The model's full context window in tokens (mirrors model_context_window in
+   * codex-rs). Arms the absolute compaction trigger (compact when TOTAL active
+   * context reaches the window, independent of the growth budget above) and
+   * the context-window-exceeded self-heal (a request rejected with "prompt is
+   * too long"/"context_length_exceeded" marks the session full, so the next
+   * turn compacts before sampling instead of failing forever). Strongly
+   * recommended for long-lived interactive threads.
+   */
+  contextWindow?: number | undefined;
+  /**
    * Max retries for transient Responses request/stream failures — network
    * errors, 5xx / 408 / 409 / 429, or a stream dropped before any visible
    * output. Each retry waits an exponential backoff (200ms × 2^(n-1) ± 10%
@@ -174,6 +185,7 @@ interface ResolvedConfig {
   loadSkillContent?: ((skill: SkillMetadata) => Promise<string>) | undefined;
   agentsMd?: string | undefined;
   autoCompactTokenLimit?: number | undefined;
+  contextWindow?: number | undefined;
   maxRetries?: number | undefined;
 }
 
@@ -206,6 +218,10 @@ export class CodexThread {
   // runTurn so auto-compaction measures context growth across turns, not just
   // within a turn (mirrors codex-rs session state). See TurnConfig.compactWindow.
   private readonly compactWindow = new AutoCompactWindow();
+  // Session-scoped token accounting — same pattern (mirrors sess token_info):
+  // usage recorded in one turn drives the NEXT turn's pre-sampling compaction
+  // check, including the context-window-exceeded self-heal. See TurnConfig.
+  private readonly tokenState = new SessionTokenState();
   private currentTurnAbort: AbortController | null = null;
 
   constructor(config: CodexThreadConfig) {
@@ -220,6 +236,7 @@ export class CodexThread {
       loadSkillContent: config.loadSkillContent,
       agentsMd: config.agentsMd,
       autoCompactTokenLimit: config.autoCompactTokenLimit,
+      contextWindow: config.contextWindow,
       maxRetries: config.maxRetries,
     };
 
@@ -315,6 +332,7 @@ export class CodexThread {
           fetch: this.config.fetch,
           model: op.model ?? this.config.model,
           compactWindow: this.compactWindow,
+          tokenState: this.tokenState,
           ...(instructions ? { instructions } : {}),
           ...(contextItems.length > 0 ? { contextItems } : {}),
           ...(this.config.skills.length > 0
@@ -325,6 +343,9 @@ export class CodexThread {
             : {}),
           ...(this.config.autoCompactTokenLimit !== undefined
             ? { autoCompactTokenLimit: this.config.autoCompactTokenLimit }
+            : {}),
+          ...(this.config.contextWindow !== undefined
+            ? { contextWindow: this.config.contextWindow }
             : {}),
           ...(this.config.maxRetries !== undefined
             ? { maxRetries: this.config.maxRetries }

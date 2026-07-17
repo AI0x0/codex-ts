@@ -10,6 +10,15 @@
 import type { ConversationItem } from "../../thread-store/src/types.js";
 import type { TurnConfig } from "./session/turn.js";
 import { parseSseStream } from "./session/sse.js";
+import {
+  computeRetryDelay,
+  DEFAULT_MAX_RETRIES,
+  isContextWindowExceededError,
+  isRetryableError,
+  parseRetryAfter,
+  ResponsesApiError,
+  sleep,
+} from "./session/retry.js";
 
 // ─── Prompt constants (verbatim from codex-rs templates) ──────────────────────
 
@@ -131,38 +140,86 @@ export async function runInlineAutoCompactTask(
   history: ConversationItem[],
   config: TurnConfig,
 ): Promise<string> {
-  // Build the compaction request: full history + the summarization prompt at the end
-  const compactInput: ConversationItem[] = [
-    ...history,
-    { type: "message", role: "user", content: SUMMARIZATION_PROMPT },
-  ];
-
-  const body: Record<string, unknown> = {
-    model: config.model,
-    input: compactInput,
-    stream: true,
-  };
-  if (config.instructions) body["instructions"] = config.instructions;
-
-  const res = await (config.fetch ?? fetch)(`${config.baseUrl}/responses`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.apiKey}`,
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok || !res.body) {
-    const text = res.body ? await res.text() : "(no body)";
-    throw new Error(`Compaction request failed ${res.status}: ${text}`);
-  }
-
-  // Collect the assistant's summary text from the stream
+  // Working copy sent to the summarizer. When the compaction request ITSELF
+  // exceeds the context window, drop the OLDEST item and retry (mirrors
+  // compact.rs:232-241 history.remove_first_item(): trims from the front to
+  // keep the prefix cache and the recent messages intact). The replacement
+  // history below is still built from the ORIGINAL `history` (mirrors rs,
+  // which collects user messages from the untrimmed session history).
+  let summarizerInput: ConversationItem[] = [...history];
+  const maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES;
+  let retries = 0;
   let summaryText = "";
-  for await (const raw of parseSseStream(res.body)) {
-    if (raw["type"] === "response.output_text.delta") {
-      summaryText += String(raw["delta"] ?? "");
+
+  for (;;) {
+    // Build the compaction request: history + the summarization prompt at the end
+    const compactInput: ConversationItem[] = [
+      ...summarizerInput,
+      { type: "message", role: "user", content: SUMMARIZATION_PROMPT },
+    ];
+
+    const body: Record<string, unknown> = {
+      model: config.model,
+      input: compactInput,
+      stream: true,
+    };
+    if (config.instructions) body["instructions"] = config.instructions;
+
+    try {
+      const res = await (config.fetch ?? fetch)(`${config.baseUrl}/responses`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${config.apiKey}`,
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok || !res.body) {
+        const text = res.body ? await res.text() : "(no body)";
+        throw new ResponsesApiError(
+          res.status,
+          text,
+          parseRetryAfter(res.headers),
+        );
+      }
+
+      // Collect the assistant's summary text from the stream
+      summaryText = "";
+      for await (const raw of parseSseStream(res.body)) {
+        if (raw["type"] === "response.output_text.delta") {
+          summaryText += String(raw["delta"] ?? "");
+        } else if (raw["type"] === "response.failed") {
+          // Terminal stream error — same classification as the turn loop
+          // (context-window-exceeded → trim; otherwise retryable).
+          const resp = raw["response"] as Record<string, unknown> | undefined;
+          throw new ResponsesApiError(
+            503,
+            JSON.stringify(resp?.["error"] ?? raw),
+          );
+        }
+      }
+      break; // summary collected → leave the retry loop
+    } catch (err) {
+      if (isContextWindowExceededError(err)) {
+        if (summarizerInput.length > 1) {
+          // mirrors compact.rs:233-240: drop the oldest item and try again.
+          summarizerInput = summarizerInput.slice(1);
+          retries = 0;
+          continue;
+        }
+        // Nothing left to trim — mark tokens full and surface the error
+        // (mirrors compact.rs:242-246).
+        config.tokenState?.setFull(config.contextWindow);
+        throw err;
+      }
+      // Transient failures back off and retry (mirrors compact.rs:248-259).
+      if (retries < maxRetries && isRetryableError(err)) {
+        retries += 1;
+        await sleep(computeRetryDelay(err, retries));
+        continue;
+      }
+      throw err;
     }
   }
 

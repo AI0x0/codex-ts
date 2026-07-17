@@ -26,6 +26,7 @@ import { parseSseStream } from "./sse.js";
 import {
   computeRetryDelay,
   DEFAULT_MAX_RETRIES,
+  isContextWindowExceededError,
   isRetryableError,
   parseRetryAfter,
   ResponsesApiError,
@@ -33,6 +34,11 @@ import {
 } from "./retry.js";
 import { runInlineAutoCompactTask } from "../compact.js";
 import { AutoCompactWindow } from "../state/auto_compact_window.js";
+import {
+  approxTokenCount,
+  estimateItemsTokenCount,
+  SessionTokenState,
+} from "../state/token_state.js";
 
 // ConversationItem from thread-store is the canonical type for both
 // history sent to the API and items persisted to the store.
@@ -81,6 +87,22 @@ export interface TurnConfig {
    */
   compactWindow?: AutoCompactWindow | undefined;
   /**
+   * The model's full context window in tokens (mirrors model_context_window in
+   * codex-rs TurnContext). Enables the SECOND compaction trigger: compact when
+   * the TOTAL active context reaches the window — independent of the growth
+   * budget above (turn.rs:752-757) — and the context-window-exceeded self-heal
+   * (a rejected request marks tokens full so the next turn compacts first,
+   * turn.rs:1045-1047). Omit to disable both (growth-only behaviour).
+   */
+  contextWindow?: number | undefined;
+  /**
+   * Session-scoped token accounting (mirrors sess.get_total_token_usage state).
+   * The thread owns ONE instance, threaded through every runTurn like
+   * compactWindow, so pre-sampling checks see usage from previous turns.
+   * Omit → a fresh per-turn state (one-shot/tests).
+   */
+  tokenState?: SessionTokenState | undefined;
+  /**
    * Max retries for transient Responses request/stream failures — network
    * errors, 5xx / 408 / 409 / 429, or a stream dropped before any visible
    * output. Each retry waits an exponential backoff (200ms × 2^(n-1) ± 10%
@@ -95,6 +117,67 @@ export interface TurnConfig {
    * messages rather than baked into the `instructions` field. Not persisted.
    */
   contextItems?: HistoryItem[] | undefined;
+}
+
+// ─── Auto-compaction status + orchestration ──────────────────────────────────
+
+/**
+ * mirrors auto_compact_token_status (turn.rs:719-769), BodyAfterPrefix scope:
+ * the limit is reached when EITHER the growth since the window baseline hits
+ * `autoCompactTokenLimit`, OR the total active context reaches the model's
+ * full `contextWindow`. The second condition is what keeps a session with a
+ * large baseline (or a force-filled one after a context-window-exceeded
+ * rejection) from sailing past the model's window.
+ */
+function autoCompactTokenStatus(
+  config: TurnConfig,
+  compactWindow: AutoCompactWindow,
+  tokenState: SessionTokenState,
+): { activeContextTokens: number; tokenLimitReached: boolean } {
+  const activeContextTokens = tokenState.totalTokens ?? 0;
+  const scopeTokens = compactWindow.bodyAfterPrefix(activeContextTokens);
+  const scopeLimit =
+    config.autoCompactTokenLimit ?? Number.POSITIVE_INFINITY;
+  const fullContextWindowLimitReached =
+    config.contextWindow !== undefined &&
+    activeContextTokens >= config.contextWindow;
+  return {
+    activeContextTokens,
+    tokenLimitReached:
+      scopeTokens >= scopeLimit || fullContextWindowLimitReached,
+  };
+}
+
+/**
+ * Run one inline compaction and reseed the token bookkeeping.
+ * mirrors run_auto_compact + recompute_token_usage (session/mod.rs:3059-3095):
+ * after history is rewritten, the session total and the NEW window's baseline
+ * both restart from a byte-based estimate of the compacted context (replaced
+ * by real server usage on the next sampled response).
+ */
+async function runCompactAndRecompute(
+  history: ConversationItem[],
+  config: TurnConfig,
+  compactWindow: AutoCompactWindow,
+  tokenState: SessionTokenState,
+  emitEvent: (msg: EventMsg) => void,
+): Promise<void> {
+  emitEvent({ type: "ContextCompacted", event: {} });
+  await runInlineAutoCompactTask(history, config);
+  compactWindow.startNext();
+  const estimated =
+    estimateItemsTokenCount([...(config.contextItems ?? []), ...history]) +
+    approxTokenCount(config.instructions ?? "");
+  tokenState.setEstimated(estimated);
+  compactWindow.setEstimatedPrefill(estimated);
+  emitEvent({
+    type: "Warning",
+    event: {
+      message:
+        "Heads up: Long threads and multiple compactions can cause the model to be less accurate. " +
+        "Start a new thread when possible to keep threads small and targeted.",
+    },
+  });
 }
 
 // ─── runTurn ─────────────────────────────────────────────────────────────────
@@ -192,6 +275,42 @@ export async function runTurn(
   // silently grows past the model's context window → "prompt is too long". Fall
   // back to a private window only when no shared one is supplied (one-shot/tests).
   const compactWindow = config.compactWindow ?? new AutoCompactWindow();
+  // Session token accounting — same thread-owned pattern (mirrors session state).
+  const tokenState = config.tokenState ?? new SessionTokenState();
+
+  // ── Estimated baseline seed (mirrors set_estimated_prefill, mod.rs:1290) ────
+  // Until the first server usage arrives (fresh thread, resumed thread, or a
+  // freshly compacted window) the window baseline and session total start from
+  // a byte-based estimate of what this turn is about to send. Server usage
+  // overrides both on the next sampled response.
+  if (compactWindow.snapshot().prefillInputTokens === null) {
+    const estimated =
+      estimateItemsTokenCount([...(config.contextItems ?? []), ...history]) +
+      approxTokenCount(config.instructions ?? "");
+    compactWindow.setEstimatedPrefill(estimated);
+    if (tokenState.totalTokens === null) {
+      tokenState.setEstimated(estimated);
+    }
+  }
+
+  // ── Pre-sampling compaction (mirrors run_pre_sampling_compact, turn.rs:149) ─
+  // Compact BEFORE the first request of the turn when the context is already
+  // at/over budget — e.g. the previous turn ended with a context-window-exceeded
+  // rejection (which force-filled the session total), or a resumed thread's
+  // history estimate already exceeds the window. This is the self-heal path:
+  // without it, every subsequent request would keep failing with 400.
+  {
+    const preStatus = autoCompactTokenStatus(config, compactWindow, tokenState);
+    if (preStatus.tokenLimitReached) {
+      await runCompactAndRecompute(
+        history,
+        config,
+        compactWindow,
+        tokenState,
+        emitEvent,
+      );
+    }
+  }
 
   for (;;) {
     // Bail out before sampling again if the turn was interrupted.
@@ -324,7 +443,8 @@ export async function runTurn(
               // the same "response.completed" (codex-api/src/sse/responses.rs) to read
               // usage. (An earlier port used "response.done", which no Responses
               // backend emits, so usage never arrived and auto-compaction never armed.)
-              // Mirrors ensure_server_observed_prefill_from_usage in auto_compact_window.rs
+              // Mirrors record_token_usage_info (turn.rs:2072): session total ←
+              // usage, window prefill ← first server-observed input_tokens.
               const resp = raw["response"] as
                 | Record<string, unknown>
                 | undefined;
@@ -333,9 +453,35 @@ export async function runTurn(
                 | undefined;
               if (typeof usage?.["input_tokens"] === "number") {
                 inputTokensThisRound = usage["input_tokens"];
+                tokenState.updateFromUsage({
+                  inputTokens: inputTokensThisRound,
+                  outputTokens:
+                    typeof usage["output_tokens"] === "number"
+                      ? usage["output_tokens"]
+                      : undefined,
+                  totalTokens:
+                    typeof usage["total_tokens"] === "number"
+                      ? usage["total_tokens"]
+                      : undefined,
+                });
                 compactWindow.ensureServerObservedPrefill(inputTokensThisRound);
               }
               break;
+            }
+            case "response.failed": {
+              // mirrors codex-api sse/responses.rs "response.failed": the stream's
+              // terminal error event. Surface it as a ResponsesApiError so the
+              // catch below classifies it — context-window-exceeded is terminal
+              // (and marks tokens full); anything else is treated as a transient
+              // stream failure (rs defaults response.failed to Retryable; the
+              // 503 status keeps it in the retryable set here).
+              const resp = raw["response"] as
+                | Record<string, unknown>
+                | undefined;
+              throw new ResponsesApiError(
+                503,
+                JSON.stringify(resp?.["error"] ?? raw),
+              );
             }
           }
         }
@@ -343,6 +489,14 @@ export async function runTurn(
       } catch (err) {
         // An interrupt is terminal — never retry past a cancellation.
         if (abortSignal?.aborted) throw err;
+        // Context-window-exceeded is terminal AND self-healing: mark the
+        // session tokens FULL so the NEXT turn's pre-sampling check compacts
+        // before sampling (mirrors turn.rs:1045-1047 set_total_tokens_full).
+        // Retrying the identical request would only fail again.
+        if (isContextWindowExceededError(err)) {
+          tokenState.setFull(config.contextWindow);
+          throw err;
+        }
         // Stop retrying once visible output streamed (would duplicate), the
         // budget is spent, or the error is not transient.
         if (
@@ -389,24 +543,21 @@ export async function runTurn(
     // ── Done when no tool calls ─────────────────────────────────────────────
     if (functionCalls.length === 0) break;
 
-    // ── Auto-compaction check (mirrors post-sampling compact in turn.rs) ─────
+    // ── Auto-compaction check (mirrors post-sampling compact, turn.rs:266-292) ─
     // Only triggered mid-turn (when there are more tool calls to dispatch),
-    // matching InitialContextInjection::BeforeLastUserMessage behaviour.
-    if (config.autoCompactTokenLimit !== undefined && inputTokensThisRound > 0) {
-      const scopeTokens = compactWindow.bodyAfterPrefix(inputTokensThisRound);
-      const limitReached = scopeTokens >= config.autoCompactTokenLimit;
-      if (limitReached) {
-        emitEvent({ type: "ContextCompacted", event: {} });
-        await runInlineAutoCompactTask(history, config);
-        compactWindow.startNext();
-        emitEvent({
-          type: "Warning",
-          event: {
-            message:
-              "Heads up: Long threads and multiple compactions can cause the model to be less accurate. " +
-              "Start a new thread when possible to keep threads small and targeted.",
-          },
-        });
+    // matching `token_limit_reached && needs_follow_up` in codex-rs. Fires on
+    // EITHER growth-since-baseline ≥ autoCompactTokenLimit OR total active
+    // context ≥ contextWindow (see autoCompactTokenStatus).
+    {
+      const status = autoCompactTokenStatus(config, compactWindow, tokenState);
+      if (status.tokenLimitReached) {
+        await runCompactAndRecompute(
+          history,
+          config,
+          compactWindow,
+          tokenState,
+          emitEvent,
+        );
       }
     }
 

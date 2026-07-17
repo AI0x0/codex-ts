@@ -12,10 +12,14 @@ import { AutoCompactWindow } from "../../src/state/auto_compact_window.js";
 import {
   collectUserMessages,
   buildCompactedHistory,
+  runInlineAutoCompactTask,
   SUMMARIZATION_PROMPT,
   SUMMARY_PREFIX,
 } from "../../src/compact.js";
 import { CodexThread } from "../../src/codex_thread.js";
+import { SessionTokenState } from "../../src/state/token_state.js";
+import { isContextWindowExceededText } from "../../src/session/retry.js";
+import type { TurnConfig } from "../../src/session/turn.js";
 import type { ConversationItem } from "../../../thread-store/src/types.js";
 import {
   evAssistantMessage,
@@ -349,5 +353,353 @@ describe("cross-turn auto-compaction (thread-owned window)", () => {
 
     // Turn1(1) + Turn2 round1(1) + compaction(1) + Turn2 round2(1) = 4.
     expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+});
+
+// ─── Shared helpers for the context-window suites ──────────────────────────────
+
+function makeErrorResponse(status: number, bodyText: string): Response {
+  return {
+    ok: false,
+    status,
+    headers: new Headers(),
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(bodyText));
+        controller.close();
+      },
+    }),
+    text: async () => bodyText,
+  } as unknown as Response;
+}
+
+function sseWithFullUsage(
+  inputTokens: number,
+  totalTokens: number,
+  items: object[],
+) {
+  return sseFlat([
+    ...items,
+    {
+      type: "response.completed",
+      response: {
+        id: "resp",
+        status: "completed",
+        usage: {
+          input_tokens: inputTokens,
+          output_tokens: totalTokens - inputTokens,
+          total_tokens: totalTokens,
+        },
+      },
+    },
+  ]);
+}
+
+// The EXACT body OpenRouter returned in the production incident (Anthropic raw
+// error wrapped in metadata.raw — no OpenAI-canonical code anywhere).
+const OPENROUTER_PROMPT_TOO_LONG_BODY = JSON.stringify({
+  error: {
+    message: "Provider returned error",
+    code: 400,
+    metadata: {
+      raw: '{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 1102084 tokens > 1000000 maximum"},"request_id":"req_x"}',
+      provider_name: "Azure",
+    },
+  },
+});
+
+// ─── Unit: context-window-exceeded classification ──────────────────────────────
+// mirrors is_context_window_error (codex-api/src/sse/responses.rs:513) — rs only
+// matches the OpenAI-canonical code; the ts port also matches each provider's
+// wording because OpenRouter/codeproxy pass the ORIGINAL provider error through.
+
+describe("isContextWindowExceededText", () => {
+  it("matches the OpenRouter/Anthropic incident payload", () => {
+    expect(isContextWindowExceededText(OPENROUTER_PROMPT_TOO_LONG_BODY)).toBe(
+      true,
+    );
+  });
+
+  it("matches the OpenAI canonical code and message", () => {
+    expect(
+      isContextWindowExceededText('{"code":"context_length_exceeded"}'),
+    ).toBe(true);
+    expect(
+      isContextWindowExceededText(
+        "Your input exceeds the context window of this model.",
+      ),
+    ).toBe(true);
+  });
+
+  it("does NOT match unrelated 4xx bodies", () => {
+    expect(
+      isContextWindowExceededText('{"error":{"message":"insufficient credits"}}'),
+    ).toBe(false);
+    expect(isContextWindowExceededText("Bad Request")).toBe(false);
+  });
+});
+
+// ─── Integration: absolute context-window trigger ──────────────────────────────
+// mirrors full_context_window_limit_reached (turn.rs:752-757): compaction must
+// fire when TOTAL active context reaches the model window even though the
+// growth-since-baseline budget (autoCompactTokenLimit) was never configured.
+
+describe("full-context-window auto-compaction", () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("compacts when total usage reaches contextWindow (no growth budget set)", async () => {
+    const fetchMock = vi.fn();
+
+    // Round 1 — tool call; usage total 810 < window 1000 → no compaction.
+    fetchMock.mockResolvedValueOnce(
+      makeSseResponse(
+        sseWithFullUsage(800, 810, [
+          evResponseCreated("r1"),
+          evFunctionCall("call-1", "get_goal", {}),
+        ]),
+      ),
+    );
+
+    // Round 2 — tool call; usage total 1020 ≥ window 1000 → compact.
+    fetchMock.mockResolvedValueOnce(
+      makeSseResponse(
+        sseWithFullUsage(1010, 1020, [
+          evResponseCreated("r2"),
+          evFunctionCall("call-2", "get_goal", {}),
+        ]),
+      ),
+    );
+
+    // Compaction request → summary.
+    fetchMock.mockResolvedValueOnce(
+      makeSseResponse(
+        sseFlat([
+          evResponseCreated("compact"),
+          evAssistantMessage("summary text"),
+          evCompleted("compact"),
+        ]),
+      ),
+    );
+
+    // Round 3 — final reply.
+    fetchMock.mockResolvedValueOnce(
+      makeSseResponse(
+        sseFlat([
+          evResponseCreated("r3"),
+          evAssistantMessage("done"),
+          evCompleted("r3"),
+        ]),
+      ),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const codex = new CodexThread({
+      apiKey: "test",
+      model: "gpt-4o",
+      contextWindow: 1000, // NOTE: no autoCompactTokenLimit at all
+    });
+
+    await codex.submit({
+      type: "UserInput",
+      items: [{ type: "text", text: "hi" }],
+    });
+    const compacted = await waitForEvent(
+      codex,
+      (msg) => msg.type === "ContextCompacted",
+    );
+    expect(compacted.type).toBe("ContextCompacted");
+    await waitForEvent(codex, (msg) => msg.type === "TurnComplete");
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    // The compaction request (index 2) carries the summarization prompt.
+    const compactBody = JSON.parse(
+      (fetchMock.mock.calls[2]![1] as RequestInit).body as string,
+    ) as { input: unknown[] };
+    expect(
+      JSON.stringify(compactBody.input[compactBody.input.length - 1]),
+    ).toContain(SUMMARIZATION_PROMPT.slice(0, 30));
+  });
+});
+
+// ─── Integration: context-window-exceeded self-heal across turns ───────────────
+// mirrors turn.rs:1045-1047 (set_total_tokens_full on ContextWindowExceeded) +
+// run_pre_sampling_compact (turn.rs:149): a rejected request marks the session
+// tokens FULL; the NEXT turn compacts BEFORE sampling instead of failing with
+// the same 400 forever — this is exactly the production incident shape.
+
+describe("context-window-exceeded self-heal", () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("marks tokens full on the 400 and compacts before sampling on the next turn", async () => {
+    const fetchMock = vi.fn();
+
+    // Turn 1 — provider rejects the sampling request outright (the incident).
+    fetchMock.mockResolvedValueOnce(
+      makeErrorResponse(400, OPENROUTER_PROMPT_TOO_LONG_BODY),
+    );
+
+    // Turn 2 — FIRST request must be the pre-sampling compaction…
+    fetchMock.mockResolvedValueOnce(
+      makeSseResponse(
+        sseFlat([
+          evResponseCreated("compact"),
+          evAssistantMessage("summary text"),
+          evCompleted("compact"),
+        ]),
+      ),
+    );
+
+    // …then the actual sampling request succeeds on the compacted history.
+    fetchMock.mockResolvedValueOnce(
+      makeSseResponse(
+        sseFlat([
+          evResponseCreated("t2"),
+          evAssistantMessage("recovered"),
+          evCompleted("t2"),
+        ]),
+      ),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const codex = new CodexThread({
+      apiKey: "test",
+      model: "gpt-4o",
+      contextWindow: 1000,
+    });
+
+    // Turn 1 fails with the 400 (no retry — the same request would fail again).
+    await codex.submit({
+      type: "UserInput",
+      items: [{ type: "text", text: "hi" }],
+    });
+    const errorEvent = await waitForEvent(codex, (msg) => msg.type === "Error");
+    expect(JSON.stringify(errorEvent)).toContain("prompt is too long");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Turn 2 self-heals: compaction first, then sampling.
+    await codex.submit({
+      type: "UserInput",
+      items: [{ type: "text", text: "continue" }],
+    });
+    const compacted = await waitForEvent(
+      codex,
+      (msg) => msg.type === "ContextCompacted",
+    );
+    expect(compacted.type).toBe("ContextCompacted");
+    await waitForEvent(codex, (msg) => msg.type === "TurnComplete");
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    // Call 2 (index 1) is the compaction request (summarization prompt last)…
+    const compactBody = JSON.parse(
+      (fetchMock.mock.calls[1]![1] as RequestInit).body as string,
+    ) as { input: unknown[] };
+    expect(
+      JSON.stringify(compactBody.input[compactBody.input.length - 1]),
+    ).toContain(SUMMARIZATION_PROMPT.slice(0, 30));
+    // …and call 3 (index 2) samples on the compacted history.
+    const finalBody = JSON.parse(
+      (fetchMock.mock.calls[2]![1] as RequestInit).body as string,
+    ) as { input: unknown[] };
+    expect(JSON.stringify(finalBody.input)).toContain(SUMMARY_PREFIX.slice(0, 30));
+  });
+});
+
+// ─── Unit: compaction request trims itself out of the window ───────────────────
+// mirrors compact.rs:232-241: when the compaction request ITSELF exceeds the
+// window, drop the OLDEST history item and retry (prefix-preserving), instead
+// of dying in the exact deadlock the production incident hit.
+
+describe("runInlineAutoCompactTask — trim on context-window-exceeded", () => {
+  function turnConfig(
+    fetchMock: typeof fetch,
+    tokenState: SessionTokenState,
+  ): TurnConfig {
+    return {
+      apiKey: "test",
+      baseUrl: "http://mock",
+      model: "gpt-4o",
+      fetch: fetchMock,
+      contextWindow: 1000,
+      tokenState,
+      maxRetries: 0,
+    };
+  }
+
+  it("drops the oldest item and retries until the summarizer fits", async () => {
+    const history: ConversationItem[] = [
+      { type: "message", role: "user", content: "oldest" },
+      { type: "message", role: "assistant", content: "middle" },
+      { type: "message", role: "user", content: "newest" },
+    ];
+    const tokenState = new SessionTokenState();
+    const fetchMock = vi
+      .fn()
+      // First attempt (full history) → the compaction request is too big.
+      .mockResolvedValueOnce(
+        makeErrorResponse(400, OPENROUTER_PROMPT_TOO_LONG_BODY),
+      )
+      // Second attempt (oldest item dropped) → summary streams back.
+      .mockResolvedValueOnce(
+        makeSseResponse(
+          sseFlat([
+            evResponseCreated("compact"),
+            evAssistantMessage("trimmed summary"),
+            evCompleted("compact"),
+          ]),
+        ),
+      );
+
+    const summary = await runInlineAutoCompactTask(
+      history,
+      turnConfig(fetchMock as unknown as typeof fetch, tokenState),
+    );
+
+    expect(summary).toBe("trimmed summary");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // Attempt 1 sent 3 history items + prompt; attempt 2 sent 2 + prompt.
+    const firstInput = (
+      JSON.parse(
+        (fetchMock.mock.calls[0]![1] as RequestInit).body as string,
+      ) as { input: unknown[] }
+    ).input;
+    const secondInput = (
+      JSON.parse(
+        (fetchMock.mock.calls[1]![1] as RequestInit).body as string,
+      ) as { input: unknown[] }
+    ).input;
+    expect(firstInput).toHaveLength(4);
+    expect(secondInput).toHaveLength(3);
+    expect(JSON.stringify(secondInput)).not.toContain("oldest");
+    // Replacement history was still built from the ORIGINAL user messages.
+    expect(JSON.stringify(history)).toContain(SUMMARY_PREFIX.slice(0, 30));
+    expect(JSON.stringify(history)).toContain("oldest");
+  });
+
+  it("marks tokens full and surfaces the error when nothing is left to trim", async () => {
+    const history: ConversationItem[] = [
+      { type: "message", role: "user", content: "only" },
+    ];
+    const tokenState = new SessionTokenState();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        makeErrorResponse(400, OPENROUTER_PROMPT_TOO_LONG_BODY),
+      );
+
+    await expect(
+      runInlineAutoCompactTask(
+        history,
+        turnConfig(fetchMock as unknown as typeof fetch, tokenState),
+      ),
+    ).rejects.toThrow(/prompt is too long/u);
+    // mirrors compact.rs:242: set_total_tokens_full before surfacing.
+    expect(tokenState.totalTokens).toBe(1000);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
