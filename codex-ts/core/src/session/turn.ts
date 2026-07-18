@@ -551,7 +551,19 @@ export async function runTurn(
     if (functionCalls.length === 0) break;
 
     // ── Dispatch tool calls ─────────────────────────────────────────────────
+    // Abort semantics (mirrors codex-rs, where the turn task is killed
+    // outright): once interrupted, never start another tool and DISCARD the
+    // result of the one that was mid-flight — do NOT record it. The next
+    // turn's normalizeHistory synthesizes an "aborted" output for the calls
+    // left unpaired. Recording here instead would race that synthesis: the
+    // new turn inserts "aborted", then this zombie loop lands the real output
+    // too → duplicate outputs for one call_id → Anthropic 400 ("each tool_use
+    // must have a single result") persisted into the thread
+    // (openrouter-responses-errors/2026-07-18/a1cf9c62).
     for (const call of functionCalls) {
+      if (abortSignal?.aborted) {
+        throw new DOMException("Turn interrupted", "AbortError");
+      }
       let args: unknown;
       try {
         args = JSON.parse(call.arguments);
@@ -564,6 +576,11 @@ export async function runTurn(
         pendingInputs,
         emitEvent,
       });
+
+      // Interrupted while this tool ran → drop its output (see block comment).
+      if (abortSignal?.aborted) {
+        throw new DOMException("Turn interrupted", "AbortError");
+      }
 
       const outputItem: HistoryItem = {
         type: "function_call_output",
