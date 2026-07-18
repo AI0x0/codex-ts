@@ -86,6 +86,30 @@ export interface WarningEvent {
   message: string;
 }
 
+/** mirrors TokenUsage (protocol.rs:1919) */
+export interface TokenUsage {
+  input_tokens: number;
+  cached_input_tokens: number;
+  output_tokens: number;
+  reasoning_output_tokens: number;
+  total_tokens: number;
+}
+
+/** mirrors TokenUsageInfo (protocol.rs:1933) */
+export interface TokenUsageInfo {
+  total_token_usage: TokenUsage;
+  last_token_usage: TokenUsage;
+  model_context_window: number | null;
+}
+
+/** mirrors TokenCountEvent (protocol.rs:2000). `rate_limits` exists in rs
+ *  (Option<RateLimitSnapshot>); the ts port does not track provider rate
+ *  limits, so it is always null here — kept in the shape for parity. */
+export interface TokenCountEvent {
+  info: TokenUsageInfo | null;
+  rate_limits: null;
+}
+
 export type EventMsg =
   | { type: "TurnStarted"; event: TurnStartedEvent }
   | { type: "TurnComplete"; event: TurnCompleteEvent }
@@ -97,6 +121,10 @@ export type EventMsg =
   | { type: "PlanUpdate"; event: UpdatePlanArgs }
   /** mirrors EventMsg::ContextCompacted — emitted when inline compaction runs */
   | { type: "ContextCompacted"; event: ContextCompactedEvent }
+  /** mirrors EventMsg::TokenCount (protocol.rs:1211) — emitted after each
+   *  sampled response's usage is recorded (send_token_count_event,
+   *  session/mod.rs:3131); hosts use it to display context consumption. */
+  | { type: "TokenCount"; event: TokenCountEvent }
   /** mirrors EventMsg::Warning — post-compaction advisory */
   | { type: "Warning"; event: WarningEvent }
   | { type: "Error"; event: ErrorEvent };

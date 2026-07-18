@@ -472,6 +472,50 @@ export async function runTurn(
                       : undefined,
                 });
                 compactWindow.ensureServerObservedPrefill(inputTokensThisRound);
+                // mirrors send_token_count_event (session/mod.rs:3131): emit the
+                // recorded usage so hosts can display context consumption. In the
+                // ts port the session total is REPLACED by each response's total
+                // (updateFromUsage), so total_token_usage mirrors last_token_usage
+                // with the session total swapped in. rate_limits: not tracked → null.
+                const numberOr = (value: unknown, fallback: number): number =>
+                  typeof value === "number" ? value : fallback;
+                const inputDetails = usage["input_tokens_details"] as
+                  | Record<string, unknown>
+                  | undefined;
+                const outputDetails = usage["output_tokens_details"] as
+                  | Record<string, unknown>
+                  | undefined;
+                const lastUsage = {
+                  input_tokens: inputTokensThisRound,
+                  cached_input_tokens: numberOr(
+                    inputDetails?.["cached_tokens"],
+                    0,
+                  ),
+                  output_tokens: numberOr(usage["output_tokens"], 0),
+                  reasoning_output_tokens: numberOr(
+                    outputDetails?.["reasoning_tokens"],
+                    0,
+                  ),
+                  total_tokens: numberOr(
+                    usage["total_tokens"],
+                    inputTokensThisRound + numberOr(usage["output_tokens"], 0),
+                  ),
+                };
+                emitEvent({
+                  type: "TokenCount",
+                  event: {
+                    info: {
+                      total_token_usage: {
+                        ...lastUsage,
+                        total_tokens:
+                          tokenState.totalTokens ?? lastUsage.total_tokens,
+                      },
+                      last_token_usage: lastUsage,
+                      model_context_window: config.contextWindow ?? null,
+                    },
+                    rate_limits: null,
+                  },
+                });
               }
               break;
             }
