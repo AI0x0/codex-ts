@@ -64,8 +64,13 @@ export function isRetryableStatus(status: number): boolean {
 //   - OpenAI:            "context_length_exceeded" / "exceeds the context window"
 //   - Anthropic/Bedrock: "prompt is too long: N tokens > M maximum"
 //   - Gemini:            "input token count ... exceeds the maximum"
+//   - OpenRouter ENDPOINT pre-check (fires before any provider is tried, so
+//     none of the provider wordings appear): "This endpoint's maximum context
+//     length is N tokens. However, you requested about M tokens" — missing
+//     this bricked the self-heal loop in prod (2026-07-18 a1d14926: a 1.42M
+//     thread 400ed forever because setFull/compact never armed).
 const CONTEXT_WINDOW_ERROR_RE =
-  /context_length_exceeded|exceeds the context window|prompt is too long|exceeds the maximum number of tokens|input token count .{0,40}exceeds/iu;
+  /context_length_exceeded|exceeds the context window|prompt is too long|exceeds the maximum number of tokens|input token count .{0,40}exceeds|maximum context length/iu;
 
 /** Message-level probe — rs classifies purely by the error payload (its
  *  canonical `code`), never by HTTP status; SSE `response.failed` has no

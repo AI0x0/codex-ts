@@ -20,6 +20,7 @@ import {
   sleep,
 } from "./session/retry.js";
 import { normalizeHistory, removeCorrespondingFor } from "./normalize.js";
+import { estimateItemsTokenCount } from "./state/token_state.js";
 
 // ─── Prompt constants (verbatim from codex-rs templates) ──────────────────────
 
@@ -153,6 +154,7 @@ export async function runInlineAutoCompactTask(
   normalizeHistory(summarizerInput);
   const maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES;
   let retries = 0;
+  let trimRounds = 0;
   let summaryText = "";
 
   for (;;) {
@@ -212,6 +214,33 @@ export async function runInlineAutoCompactTask(
           // then try again.
           const removed = summarizerInput.shift();
           if (removed) removeCorrespondingFor(summarizerInput, removed);
+          // rs drops exactly ONE item per rejected probe — fine on its 200k
+          // windows where the overflow is a few k tokens. A pathological
+          // thread on a 1M window can overflow by 40%+ (prod 2026-07-18
+          // a1d14926: 1.42M tokens), where one-item-per-request means
+          // hundreds of full-size round trips — the rs semantic ("trim from
+          // the front until the summarizer fits") never completes in
+          // practice. Reach the same end state in bulk: after the rs-style
+          // shift, keep trimming until the byte-based estimate fits a
+          // GEOMETRICALLY SHRINKING target (contextWindow × 0.85^round). The
+          // estimate undercounts CJK (~chars/4), so a fixed target could
+          // stall above the real limit — the shrinking target guarantees
+          // each rejected probe cuts strictly deeper, converging in a few
+          // rounds instead of hundreds.
+          trimRounds += 1;
+          if (config.contextWindow !== undefined) {
+            const target = Math.max(
+              1,
+              Math.floor(config.contextWindow * Math.pow(0.85, trimRounds)),
+            );
+            while (
+              summarizerInput.length > 1 &&
+              estimateItemsTokenCount(summarizerInput) > target
+            ) {
+              const next = summarizerInput.shift();
+              if (next) removeCorrespondingFor(summarizerInput, next);
+            }
+          }
           retries = 0;
           continue;
         }

@@ -408,6 +408,29 @@ const OPENROUTER_PROMPT_TOO_LONG_BODY = JSON.stringify({
   },
 });
 
+// The EXACT body from the 2026-07-18 a1d14926 incident: OpenRouter's own
+// ENDPOINT pre-check rejects before any provider is tried, so none of the
+// provider wordings ("prompt is too long", "context_length_exceeded") appear.
+// Missing this pattern bricked the self-heal: setFull/compact never armed and
+// the 1.42M-token thread 400ed forever.
+const OPENROUTER_ENDPOINT_TOO_LONG_BODY = JSON.stringify({
+  error: {
+    message:
+      "This endpoint's maximum context length is 1000000 tokens. However, you requested about 1421428 tokens (1387828 of text input, 33600 of image input). Please reduce the length of either one, or use the context-compression plugin to compress your prompt automatically.",
+    code: 400,
+    metadata: {
+      provider_name: null,
+      previous_errors: [
+        {
+          code: 400,
+          message:
+            "This endpoint's maximum context length is 1000000 tokens. However, you requested about 1421428 tokens (1387828 of text input, 33600 of image input). Please reduce the length of either one, or use the context-compression plugin to compress your prompt automatically.",
+        },
+      ],
+    },
+  },
+});
+
 // ─── Unit: context-window-exceeded classification ──────────────────────────────
 // mirrors is_context_window_error (codex-api/src/sse/responses.rs:513) — rs only
 // matches the OpenAI-canonical code; the ts port also matches each provider's
@@ -416,6 +439,12 @@ const OPENROUTER_PROMPT_TOO_LONG_BODY = JSON.stringify({
 describe("isContextWindowExceededText", () => {
   it("matches the OpenRouter/Anthropic incident payload", () => {
     expect(isContextWindowExceededText(OPENROUTER_PROMPT_TOO_LONG_BODY)).toBe(
+      true,
+    );
+  });
+
+  it("matches OpenRouter's own endpoint pre-check rejection (a1d14926)", () => {
+    expect(isContextWindowExceededText(OPENROUTER_ENDPOINT_TOO_LONG_BODY)).toBe(
       true,
     );
   });
@@ -701,5 +730,55 @@ describe("runInlineAutoCompactTask — trim on context-window-exceeded", () => {
     // mirrors compact.rs:242: set_total_tokens_full before surfacing.
     expect(tokenState.totalTokens).toBe(1000);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("converges in a few probes on a massively oversized history (bulk trim, a1d14926)", async () => {
+    // 400 items whose real token cost is 2× the chars/4 estimate (CJK-style
+    // undercount). One-item-per-probe (plain rs behavior) would need ~370
+    // probes; the geometric bulk trim must land within a handful.
+    const history: ConversationItem[] = Array.from({ length: 400 }, (_, i) => ({
+      type: "message" as const,
+      role: "user" as const,
+      content: `msg-${String(i).padStart(3, "0")}-${"x".repeat(52)}`,
+    }));
+    const tokenState = new SessionTokenState();
+    // Simulated provider hard limit in REAL tokens, where real = chars/2
+    // (twice the chars/4 estimate the trimmer budgets with).
+    const HARD_LIMIT_REAL_TOKENS = 2000;
+    const fetchMock = vi.fn().mockImplementation(
+      async (_url: string, init: RequestInit) => {
+        const realTokens = Math.ceil((init.body as string).length / 2);
+        if (realTokens > HARD_LIMIT_REAL_TOKENS) {
+          return makeErrorResponse(400, OPENROUTER_ENDPOINT_TOO_LONG_BODY);
+        }
+        return makeSseResponse(
+          sseFlat([
+            evResponseCreated("compact"),
+            evAssistantMessage("bulk summary"),
+            evCompleted("compact"),
+          ]),
+        );
+      },
+    );
+
+    const summary = await runInlineAutoCompactTask(
+      history,
+      turnConfig(fetchMock as unknown as typeof fetch, tokenState),
+    );
+
+    expect(summary).toBe("bulk summary");
+    // At least one rejected probe (the initial full-size request), and FAR
+    // fewer round trips than the ~370 a one-item-per-probe loop would need.
+    expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(6);
+    // The accepted request actually fit under the simulated hard limit.
+    const lastBody = (
+      fetchMock.mock.calls[fetchMock.mock.calls.length - 1]![1] as RequestInit
+    ).body as string;
+    expect(Math.ceil(lastBody.length / 2)).toBeLessThanOrEqual(
+      HARD_LIMIT_REAL_TOKENS,
+    );
+    // Replacement history was still built from the ORIGINAL (untrimmed) one.
+    expect(JSON.stringify(history)).toContain(SUMMARY_PREFIX.slice(0, 30));
   });
 });
