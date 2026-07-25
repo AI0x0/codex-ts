@@ -353,7 +353,6 @@ export async function runTurn(
     // re-streaming after that would duplicate text downstream.
     const functionCalls: { call_id: string; name: string; arguments: string }[] =
       [];
-    const partialArgs = new Map<string, { name: string; args: string }>();
     let assistantText = "";
     let currentItemId = `item-${++itemIdCounter}`;
     let inputTokensThisRound = 0;
@@ -362,7 +361,6 @@ export async function runTurn(
     for (;;) {
       // A retry re-streams from scratch → reset per-attempt accumulators.
       functionCalls.length = 0;
-      partialArgs.clear();
       assistantText = "";
       currentItemId = `item-${++itemIdCounter}`;
       inputTokensThisRound = 0;
@@ -396,10 +394,10 @@ export async function runTurn(
           switch (raw["type"]) {
             case "response.output_item.added": {
               const item = raw["item"] as Record<string, unknown> | undefined;
-              if (item?.["type"] === "function_call") {
-                const cid = String(item["call_id"]);
-                partialArgs.set(cid, { name: String(item["name"]), args: "" });
-              } else if (item?.["type"] === "message") {
+              // function_call 的 arguments 整体来自下面的 output_item.done；
+              // codex-rs 不累积 arg-delta（codex-api/src/sse/responses.rs 丢弃
+              // response.function_call_arguments.delta），故此处只跟踪 message item id。
+              if (item?.["type"] === "message") {
                 currentItemId = String(item["id"] ?? currentItemId);
               }
               break;
@@ -429,11 +427,9 @@ export async function runTurn(
               });
               break;
             }
-            case "response.function_call_arguments.delta": {
-              const partial = partialArgs.get(String(raw["call_id"] ?? ""));
-              if (partial) partial.args += String(raw["delta"] ?? "");
-              break;
-            }
+            // response.function_call_arguments.delta 不处理：function_call 的
+            // arguments 整体来自 output_item.done；codex-rs 亦丢弃该 delta 事件
+            // （codex-api/src/sse/responses.rs 落 `_ =>`），不做累积。
             case "response.output_item.done": {
               const item = raw["item"] as Record<string, unknown> | undefined;
               if (item?.["type"] === "function_call") {
@@ -611,8 +607,25 @@ export async function runTurn(
       let args: unknown;
       try {
         args = JSON.parse(call.arguments);
-      } catch {
-        args = {};
+        if (typeof args !== "object" || args === null || Array.isArray(args)) {
+          // rs 的 from_str::<Struct> 对非对象（如 "5"、"[...]"）同样失败。
+          throw new Error("expected a JSON object");
+        }
+      } catch (err) {
+        // mirror codex-rs：参数无法解析 → 把错误当 function_call_output 回给模型、
+        // 跳过 dispatch，绝不拿空参执行工具（tools/handlers/mod.rs:77-84 parse_arguments
+        // → tools/parallel.rs:186-209 failure_response；MCP 同义 mcp_tool_call.rs:117-132）。
+        // 该 call 已作为 function_call 入 history 且仍在 functionCalls，本轮不 break，
+        // 外层 for(;;) 会再采样让模型看到错误 = rs 的 needs_follow_up。
+        const message = err instanceof Error ? err.message : String(err);
+        const errorItem: HistoryItem = {
+          type: "function_call_output",
+          call_id: call.call_id,
+          output: `failed to parse function arguments: ${message}`,
+        };
+        history.push(errorItem);
+        await liveThread?.appendConversationItems([errorItem]);
+        continue;
       }
 
       const output = await router.dispatch(call.name, call.call_id, args, {
