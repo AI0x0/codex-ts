@@ -166,8 +166,8 @@ pub enum ApprovalsReviewer {
     #[default]
     #[serde(rename = "user")]
     User,
-    #[serde(rename = "guardian_subagent", alias = "auto_review")]
-    #[strum(serialize = "guardian_subagent")]
+    #[serde(rename = "auto_review", alias = "guardian_subagent")]
+    #[strum(serialize = "auto_review")]
     AutoReview,
 }
 
@@ -197,6 +197,16 @@ pub enum ShellEnvironmentPolicyInherit {
 
     /// Do not inherit any environment variables from the parent process.
     None,
+}
+
+/// Assigns a shell environment variable pattern to the include-only or exclude
+/// set. Includes do not re-add variables removed by another exclude pattern.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export_to = "v2/")]
+pub enum ShellEnvironmentPolicyFilter {
+    Include,
+    Exclude,
 }
 
 pub type EnvironmentVariablePattern = WildMatchPattern<'*', '?'>;
@@ -273,6 +283,16 @@ pub enum WindowsSandboxLevel {
     Elevated,
 }
 
+/// Controls whether a Windows sandbox launch reconciles persistent proxy settings or preserves
+/// the settings established by another launch.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WindowsSandboxProxySettingsMode {
+    #[default]
+    Reconcile,
+    Preserve,
+}
+
 #[derive(
     Debug,
     Serialize,
@@ -296,15 +316,49 @@ pub enum Personality {
     Pragmatic,
 }
 
+/// Controls the effective multi-agent delegation instructions for a turn. `custom` means the
+/// configured mode hint defines the policy instead of a built-in policy.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Display, JsonSchema, TS, Default)]
+#[serde(rename_all = "camelCase", from = "MultiAgentModeWire")]
+#[ts(rename_all = "camelCase")]
+#[strum(serialize_all = "camelCase")]
+pub enum MultiAgentMode {
+    Custom(String),
+    #[default]
+    ExplicitRequestOnly,
+    Proactive,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum MultiAgentModeWire {
+    None,
+    Custom(String),
+    ExplicitRequestOnly,
+    Proactive,
+}
+
+impl From<MultiAgentModeWire> for MultiAgentMode {
+    fn from(value: MultiAgentModeWire) -> Self {
+        match value {
+            MultiAgentModeWire::None => Self::Custom(String::new()),
+            MultiAgentModeWire::Custom(hint_text) => Self::Custom(hint_text),
+            MultiAgentModeWire::ExplicitRequestOnly => Self::ExplicitRequestOnly,
+            MultiAgentModeWire::Proactive => Self::Proactive,
+        }
+    }
+}
+
 #[derive(
     Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Display, JsonSchema, TS, Default,
 )]
-#[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum WebSearchMode {
     Disabled,
     #[default]
     Cached,
+    Indexed,
     Live,
 }
 
@@ -635,7 +689,7 @@ impl CollaborationMode {
     }
 
     pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
-        self.settings_ref().reasoning_effort
+        self.settings_ref().reasoning_effort.clone()
     }
 
     /// Updates the collaboration mode with new model and/or effort values.
@@ -654,7 +708,7 @@ impl CollaborationMode {
         let settings = self.settings_ref();
         let updated_settings = Settings {
             model: model.unwrap_or_else(|| settings.model.clone()),
-            reasoning_effort: effort.unwrap_or(settings.reasoning_effort),
+            reasoning_effort: effort.unwrap_or_else(|| settings.reasoning_effort.clone()),
             developer_instructions: developer_instructions
                 .unwrap_or_else(|| settings.developer_instructions.clone()),
         };
@@ -676,7 +730,10 @@ impl CollaborationMode {
             mode: mask.mode.unwrap_or(self.mode),
             settings: Settings {
                 model: mask.model.clone().unwrap_or_else(|| settings.model.clone()),
-                reasoning_effort: mask.reasoning_effort.unwrap_or(settings.reasoning_effort),
+                reasoning_effort: mask
+                    .reasoning_effort
+                    .clone()
+                    .unwrap_or_else(|| settings.reasoning_effort.clone()),
                 developer_instructions: mask
                     .developer_instructions
                     .clone()
@@ -757,7 +814,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&ApprovalsReviewer::AutoReview).expect("serialize reviewer"),
-            "\"guardian_subagent\""
+            "\"auto_review\""
         );
 
         for value in ["user", "auto_review", "guardian_subagent"] {

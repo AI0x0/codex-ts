@@ -93,6 +93,127 @@ fn builder_with_edits_applies_custom_paths() {
     assert_eq!(contents, "enabled = true\n");
 }
 
+/// Toggling multi-agent v2 must preserve settings stored in its feature table.
+#[test]
+fn multi_agent_v2_feature_toggle_preserves_nested_configuration() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+    let config_path = codex_home.join(CONFIG_TOML_FILE);
+    std::fs::write(
+        &config_path,
+        "[features.multi_agent_v2]\nenabled = true\nsubagent_usage_hint_text = \"Delegate carefully.\"\n",
+    )
+    .expect("write config");
+
+    ConfigEditsBuilder::new(codex_home)
+        .set_feature_enabled("multi_agent_v2", /*enabled*/ false)
+        .apply_blocking()
+        .expect("disable feature");
+    let disabled: TomlValue =
+        toml::from_str(&std::fs::read_to_string(&config_path).expect("read disabled config"))
+            .expect("parse disabled config");
+    assert_eq!(
+        disabled,
+        toml::from_str::<TomlValue>(
+            "[features.multi_agent_v2]\nenabled = false\nsubagent_usage_hint_text = \"Delegate carefully.\"\n",
+        )
+        .expect("parse expected config")
+    );
+
+    ConfigEditsBuilder::new(codex_home)
+        .set_feature_enabled("multi_agent_v2", /*enabled*/ true)
+        .apply_blocking()
+        .expect("enable feature");
+    let enabled: TomlValue =
+        toml::from_str(&std::fs::read_to_string(&config_path).expect("read enabled config"))
+            .expect("parse enabled config");
+    assert_eq!(
+        enabled,
+        toml::from_str::<TomlValue>(
+            "[features.multi_agent_v2]\nenabled = true\nsubagent_usage_hint_text = \"Delegate carefully.\"\n",
+        )
+        .expect("parse expected config")
+    );
+}
+
+/// Adding nested multi-agent settings must retain an existing legacy boolean toggle.
+#[test]
+fn multi_agent_v2_nested_edit_preserves_legacy_boolean_toggle() {
+    for feature_path in ["features", "profiles.work.features"] {
+        let tmp = tempdir().expect("tmpdir");
+        let codex_home = tmp.path();
+        let config_path = codex_home.join(CONFIG_TOML_FILE);
+        std::fs::write(
+            &config_path,
+            format!("[{feature_path}]\nmulti_agent_v2 = true\n"),
+        )
+        .expect("write config");
+        let mut feature_segments = feature_path
+            .split('.')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        feature_segments.push("multi_agent_v2".to_string());
+        let mut instruction_segments = feature_segments.clone();
+        instruction_segments.push("subagent_usage_hint_text".to_string());
+
+        ConfigEditsBuilder::new(codex_home)
+            .with_edits([ConfigEdit::SetPath {
+                segments: instruction_segments,
+                value: value("Delegate carefully."),
+            }])
+            .apply_blocking()
+            .expect("persist nested config");
+
+        let updated: TomlValue =
+            toml::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+                .expect("parse config");
+        assert_eq!(
+            updated,
+            toml::from_str::<TomlValue>(&format!(
+                "[{feature_path}.multi_agent_v2]\nenabled = true\nsubagent_usage_hint_text = \"Delegate carefully.\"\n",
+            ))
+            .expect("parse expected config")
+        );
+
+        ConfigEditsBuilder::new(codex_home)
+            .with_edits([ConfigEdit::SetPath {
+                segments: feature_segments.clone(),
+                value: value(false),
+            }])
+            .apply_blocking()
+            .expect("disable feature");
+
+        let disabled: TomlValue =
+            toml::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+                .expect("parse config");
+        assert_eq!(
+            disabled,
+            toml::from_str::<TomlValue>(&format!(
+                "[{feature_path}.multi_agent_v2]\nenabled = false\nsubagent_usage_hint_text = \"Delegate carefully.\"\n",
+            ))
+            .expect("parse expected config")
+        );
+
+        ConfigEditsBuilder::new(codex_home)
+            .with_edits([ConfigEdit::ClearPath {
+                segments: feature_segments,
+            }])
+            .apply_blocking()
+            .expect("clear feature toggle");
+
+        let cleared: TomlValue =
+            toml::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+                .expect("parse config");
+        assert_eq!(
+            feature_path
+                .split('.')
+                .try_fold(&cleared, |config, segment| config.get(segment))
+                .and_then(|features| features.get("multi_agent_v2")),
+            None
+        );
+    }
+}
+
 #[test]
 fn session_picker_view_edit_writes_root_tui_setting() {
     let tmp = tempdir().expect("tmpdir");
@@ -873,6 +994,7 @@ fn blocking_replace_mcp_servers_round_trips() {
     servers.insert(
         "stdio".to_string(),
         McpServerConfig {
+            auth: Default::default(),
             transport: McpServerTransportConfig::Stdio {
                 command: "cmd".to_string(),
                 args: vec!["--flag".to_string()],
@@ -907,6 +1029,7 @@ fn blocking_replace_mcp_servers_round_trips() {
     servers.insert(
         "http".to_string(),
         McpServerConfig {
+            auth: Default::default(),
             transport: McpServerTransportConfig::StreamableHttp {
                 url: "https://example.com".to_string(),
                 bearer_token_env_var: Some("TOKEN".to_string()),
@@ -981,6 +1104,7 @@ fn blocking_replace_mcp_servers_serializes_tool_approval_overrides() {
     servers.insert(
         "docs".to_string(),
         McpServerConfig {
+            auth: Default::default(),
             transport: McpServerTransportConfig::Stdio {
                 command: "docs-server".to_string(),
                 args: Vec::new(),
@@ -1041,6 +1165,7 @@ foo = { command = "cmd" }
     servers.insert(
         "foo".to_string(),
         McpServerConfig {
+            auth: Default::default(),
             transport: McpServerTransportConfig::Stdio {
                 command: "cmd".to_string(),
                 args: Vec::new(),
@@ -1091,6 +1216,7 @@ foo = { command = "cmd" } # keep me
     servers.insert(
         "foo".to_string(),
         McpServerConfig {
+            auth: Default::default(),
             transport: McpServerTransportConfig::Stdio {
                 command: "cmd".to_string(),
                 args: Vec::new(),
@@ -1140,6 +1266,7 @@ foo = { command = "cmd", args = ["--flag"] } # keep me
     servers.insert(
         "foo".to_string(),
         McpServerConfig {
+            auth: Default::default(),
             transport: McpServerTransportConfig::Stdio {
                 command: "cmd".to_string(),
                 args: Vec::new(),
@@ -1190,6 +1317,7 @@ foo = { command = "cmd" }
     servers.insert(
         "foo".to_string(),
         McpServerConfig {
+            auth: Default::default(),
             transport: McpServerTransportConfig::Stdio {
                 command: "cmd".to_string(),
                 args: Vec::new(),

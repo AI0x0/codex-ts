@@ -4,6 +4,13 @@
 use codex_core::exec_env::create_env;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSpecialPath;
+use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::io::Read;
@@ -28,6 +35,8 @@ const MANAGED_PROXY_PERMISSION_ERR_SNIPPETS: &[&str] = &[
 const PROXY_ENV_KEYS: &[&str] = &[
     "HTTP_PROXY",
     "HTTPS_PROXY",
+    "WS_PROXY",
+    "WSS_PROXY",
     "ALL_PROXY",
     "FTP_PROXY",
     "YARN_HTTP_PROXY",
@@ -119,14 +128,9 @@ async fn run_linux_sandbox_direct(
     env: HashMap<String, String>,
     timeout_ms: u64,
 ) -> Output {
-    let cwd = match std::env::current_dir() {
-        Ok(cwd) => cwd,
-        Err(err) => panic!("cwd should exist: {err}"),
-    };
-    let permission_profile_json = match serde_json::to_string(permission_profile) {
-        Ok(permission_profile_json) => permission_profile_json,
-        Err(err) => panic!("permission profile should serialize: {err}"),
-    };
+    let cwd = std::env::current_dir().expect("current directory should exist");
+    let permission_profile_json =
+        serde_json::to_string(permission_profile).expect("permission profile should serialize");
 
     let mut args = vec![
         "--sandbox-policy-cwd".to_string(),
@@ -148,14 +152,10 @@ async fn run_linux_sandbox_direct(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = match tokio::time::timeout(Duration::from_millis(timeout_ms), cmd.output()).await {
-        Ok(output) => output,
-        Err(err) => panic!("sandbox command should not time out: {err}"),
-    };
-    match output {
-        Ok(output) => output,
-        Err(err) => panic!("sandbox command should execute: {err}"),
-    }
+    tokio::time::timeout(Duration::from_millis(timeout_ms), cmd.output())
+        .await
+        .expect("sandbox command should not time out")
+        .expect("sandbox command should execute")
 }
 
 #[tokio::test]
@@ -218,14 +218,40 @@ async fn managed_proxy_mode_routes_through_bridge_and_blocks_direct_egress() {
         "HTTP_PROXY".to_string(),
         format!("http://127.0.0.1:{proxy_port}"),
     );
+    env.insert(
+        "WSS_PROXY".to_string(),
+        format!("http://127.0.0.1:{proxy_port}"),
+    );
+
+    let sandbox_helper_dir = std::path::Path::new(env!("CARGO_BIN_EXE_codex-linux-sandbox"))
+        .parent()
+        .expect("sandbox helper should have a parent");
+    let file_system_sandbox_policy =
+        FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Minimal,
+            },
+            access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
+        }])
+        .with_additional_readable_roots(
+            std::env::current_dir()
+                .expect("current directory should exist")
+                .as_path(),
+            &[AbsolutePathBuf::try_from(sandbox_helper_dir).expect("absolute helper dir")],
+        );
+    let permission_profile = PermissionProfile::from_runtime_permissions(
+        &file_system_sandbox_policy,
+        NetworkSandboxPolicy::Restricted,
+    );
 
     let routed_output = run_linux_sandbox_direct(
         &[
             "bash",
             "-c",
-            "proxy=\"${HTTP_PROXY#*://}\"; host=\"${proxy%%:*}\"; port=\"${proxy##*:}\"; exec 3<>/dev/tcp/${host}/${port}; printf 'GET http://example.com/ HTTP/1.1\\r\\nHost: example.com\\r\\n\\r\\n' >&3; IFS= read -r line <&3; printf '%s\\n' \"$line\"",
+            "proxy=\"${WSS_PROXY#*://}\"; host=\"${proxy%%:*}\"; port=\"${proxy##*:}\"; exec 3<>/dev/tcp/${host}/${port}; printf 'GET http://example.com/ HTTP/1.1\\r\\nHost: example.com\\r\\n\\r\\n' >&3; IFS= read -r line <&3; printf '%s\\n' \"$line\"",
         ],
-        &PermissionProfile::Disabled,
+        &permission_profile,
         /*allow_network_for_proxy*/ true,
         env.clone(),
         NETWORK_TIMEOUT_MS,
@@ -266,7 +292,7 @@ async fn managed_proxy_mode_routes_through_bridge_and_blocks_direct_egress() {
 }
 
 #[tokio::test]
-async fn managed_proxy_mode_denies_af_unix_creation_for_user_command() {
+async fn managed_proxy_mode_denies_af_unix_socket_but_allows_socketpair() {
     if let Some(skip_reason) = managed_proxy_skip_reason().await {
         eprintln!("skipping managed proxy test: {skip_reason}");
         return;
@@ -292,7 +318,7 @@ async fn managed_proxy_mode_denies_af_unix_creation_for_user_command() {
         &[
             "python3",
             "-c",
-            "import socket,sys\ntry:\n    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\nexcept PermissionError:\n    sys.exit(0)\nexcept OSError:\n    sys.exit(2)\nsys.exit(1)\n",
+            "import socket,sys\ntry:\n    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\nexcept PermissionError:\n    pass\nexcept OSError:\n    sys.exit(2)\nelse:\n    sys.exit(1)\nleft,right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)\nleft.sendall(b'ok')\nif right.recv(2) != b'ok':\n    sys.exit(3)\n",
         ],
         &PermissionProfile::Disabled,
         /*allow_network_for_proxy*/ true,
@@ -304,7 +330,7 @@ async fn managed_proxy_mode_denies_af_unix_creation_for_user_command() {
     assert_eq!(
         output.status.code(),
         Some(0),
-        "expected AF_UNIX creation to be denied cleanly for user command; status={:?}; stdout={}; stderr={}",
+        "expected AF_UNIX socket creation to be denied and socketpair to work; status={:?}; stdout={}; stderr={}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)

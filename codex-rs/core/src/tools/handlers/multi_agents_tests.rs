@@ -1,15 +1,19 @@
 use super::*;
+use crate::StartThreadOptions;
 use crate::ThreadManager;
 use crate::config::AgentRoleConfig;
 use crate::config::DEFAULT_AGENT_MAX_DEPTH;
 use crate::function_tool::FunctionCallError;
 use crate::init_state_db;
+use crate::local_agent_graph_store_from_state_db;
+use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
-use crate::session_prefix::format_subagent_notification_message;
+use crate::session::turn_context::TurnContext;
+use crate::session_prefix::format_inter_agent_completion_message;
 use crate::thread_manager::thread_store_from_config;
 use crate::tools::context::ToolOutput;
-use crate::tools::handlers::multi_agents_v2::CloseAgentHandler as CloseAgentHandlerV2;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
+use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
@@ -23,6 +27,7 @@ use codex_model_provider::create_model_provider;
 use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::models::BaseInstructions;
@@ -71,8 +76,10 @@ fn invocation(
     tool_name: &str,
     payload: ToolPayload,
 ) -> ToolInvocation {
+    let step_context = StepContext::for_test(Arc::clone(&turn));
     ToolInvocation {
         session,
+        step_context,
         turn,
         cancellation_token: CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::default())),
@@ -174,7 +181,11 @@ struct ListAgentsResult {
 struct ListedAgentResult {
     agent_name: String,
     agent_status: serde_json::Value,
-    last_task_message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InterruptAgentResult {
+    previous_status: AgentStatus,
 }
 
 #[tokio::test]
@@ -306,7 +317,7 @@ async fn spawn_agent_fork_context_rejects_agent_type_override() {
     let role_name = install_role_with_model_override(&mut turn).await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -329,42 +340,7 @@ async fn spawn_agent_fork_context_rejects_agent_type_override() {
     assert_eq!(
         err,
         FunctionCallError::RespondToModel(
-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
-        )
-    );
-}
-
-#[tokio::test]
-async fn spawn_agent_fork_context_rejects_child_model_overrides() {
-    let (mut session, turn) = make_session_and_context().await;
-    let manager = thread_manager();
-    let root = manager
-        .start_thread((*turn.config).clone())
-        .await
-        .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
-    session.thread_id = root.thread_id;
-
-    let err = SpawnAgentHandler::default()
-        .handle(invocation(
-            Arc::new(session),
-            Arc::new(turn),
-            "spawn_agent",
-            function_payload(json!({
-                "message": "inspect this repo",
-                "model": "gpt-5-child-override",
-                "reasoning_effort": "low",
-                "fork_context": true
-            })),
-        ))
-        .await
-        .err()
-        .expect("forked spawn should reject child model overrides");
-
-    assert_eq!(
-        err,
-            FunctionCallError::RespondToModel(
-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
+            "Full-history forked agents inherit the parent agent type; omit agent_type, or spawn without a full-history fork.".to_string(),
         )
     );
 }
@@ -375,7 +351,7 @@ async fn multi_agent_v2_spawn_fork_turns_all_rejects_agent_type_override() {
     let role_name = install_role_with_model_override(&mut turn).await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -410,21 +386,14 @@ async fn multi_agent_v2_spawn_fork_turns_all_rejects_agent_type_override() {
     assert_eq!(
         err,
         FunctionCallError::RespondToModel(
-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
+            "Full-history forked agents inherit the parent agent type; omit agent_type, or spawn without a full-history fork.".to_string(),
         )
     );
 }
 
 #[tokio::test]
-async fn multi_agent_v2_spawn_defaults_to_full_fork_and_rejects_child_model_overrides() {
-    let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
-    let root = manager
-        .start_thread((*turn.config).clone())
-        .await
-        .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
-    session.thread_id = root.thread_id;
+async fn multi_agent_v2_spawn_rejects_child_model_from_different_backend() {
+    let (session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
     config
         .features
@@ -439,19 +408,20 @@ async fn multi_agent_v2_spawn_defaults_to_full_fork_and_rejects_child_model_over
             "spawn_agent",
             function_payload(json!({
                 "message": "inspect this repo",
-                "task_name": "fork_context_v2",
-                "model": "gpt-5-child-override",
-                "reasoning_effort": "low"
+                "task_name": "incompatible_model",
+                "model": "gpt-5.4",
+                "fork_turns": "none"
             })),
         ))
         .await
         .err()
-        .expect("default full fork should reject child model overrides");
+        .expect("model from a different multi-agent backend should be rejected");
 
     assert_eq!(
         err,
-            FunctionCallError::RespondToModel(
-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
+        FunctionCallError::RespondToModel(
+            "Unknown model `gpt-5.4` for spawn_agent. Available models: gpt-5.6-sol, gpt-5.6-terra"
+                .to_string()
         )
     );
 }
@@ -467,7 +437,7 @@ async fn spawn_agent_service_tier_override_validates_the_effective_child_model()
         let (mut session, turn) = make_session_and_context().await;
         let manager = thread_manager();
         let root = manager
-            .start_thread((*turn.config).clone())
+            .start_thread(StartThreadOptions::new((*turn.config).clone()))
             .await
             .expect("root thread should start");
         session.services.agent_control = manager.agent_control();
@@ -537,7 +507,7 @@ async fn spawn_agent_service_tier_override_validates_the_effective_child_model()
                 "spawn_agent",
                 function_payload(json!({
                     "message": "inspect this repo",
-                    "model": "gpt-5.3-codex",
+                    "model": "gpt-5.4-mini",
                     "service_tier": ServiceTier::Fast.request_value()
                 })),
             ))
@@ -548,7 +518,7 @@ async fn spawn_agent_service_tier_override_validates_the_effective_child_model()
         assert_eq!(
             err,
             FunctionCallError::RespondToModel(
-                "Service tier `priority` is not supported for model `gpt-5.3-codex`. Supported service tiers: none"
+                "Service tier `priority` is not supported for model `gpt-5.4-mini`. Supported service tiers: none"
                     .to_string()
             )
         );
@@ -572,7 +542,7 @@ async fn spawn_agent_service_tier_inheritance_preserves_supported_or_configured_
         turn.config = Arc::new(config);
         let manager = thread_manager();
         let root = manager
-            .start_thread((*turn.config).clone())
+            .start_thread(StartThreadOptions::new((*turn.config).clone()))
             .await
             .expect("root thread should start");
         session.services.agent_control = manager.agent_control();
@@ -613,7 +583,7 @@ async fn spawn_agent_service_tier_inheritance_preserves_supported_or_configured_
         turn.config = Arc::new(config);
         let manager = thread_manager();
         let root = manager
-            .start_thread((*turn.config).clone())
+            .start_thread(StartThreadOptions::new((*turn.config).clone()))
             .await
             .expect("root thread should start");
         session.services.agent_control = manager.agent_control();
@@ -626,7 +596,7 @@ async fn spawn_agent_service_tier_inheritance_preserves_supported_or_configured_
                 "spawn_agent",
                 function_payload(json!({
                     "message": "inspect this repo",
-                    "model": "gpt-5.3-codex"
+                    "model": "gpt-5.4-mini"
                 })),
             ))
             .await
@@ -676,7 +646,7 @@ service_tier = "priority"
         turn.config = Arc::new(config);
         let manager = thread_manager();
         let root = manager
-            .start_thread((*turn.config).clone())
+            .start_thread(StartThreadOptions::new((*turn.config).clone()))
             .await
             .expect("root thread should start");
         session.services.agent_control = manager.agent_control();
@@ -749,7 +719,7 @@ service_tier = "turbo"
     turn.config = Arc::new(config);
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -846,7 +816,7 @@ async fn spawn_agent_full_history_fork_accepts_explicit_service_tier() {
         .await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -900,7 +870,7 @@ async fn multi_agent_v2_full_history_fork_accepts_explicit_service_tier() {
     set_turn_config(&mut turn, config);
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -953,7 +923,7 @@ async fn multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override() {
     let role_name = install_role_with_model_override(&mut turn).await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1037,7 +1007,7 @@ async fn multi_agent_v2_spawn_requires_task_name() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1071,7 +1041,7 @@ async fn multi_agent_v2_spawn_rejects_legacy_items_field() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1131,7 +1101,7 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1151,7 +1121,7 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
             turn.clone(),
             "spawn_agent",
             function_payload(json!({
-                "message": "inspect this repo",
+                "message": "encrypted-spawn-message",
                 "task_name": "test_process"
             })),
         ))
@@ -1187,7 +1157,8 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
                     if communication.author == AgentPath::root()
                         && communication.recipient.as_str() == "/root/test_process"
                         && communication.other_recipients.is_empty()
-                        && communication.content == "inspect this repo"
+                        && communication.content.is_empty()
+                        && communication.encrypted_content.as_deref() == Some("encrypted-spawn-message")
                         && communication.trigger_turn
             )
     }));
@@ -1199,7 +1170,7 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
             "send_message",
             function_payload(json!({
                 "target": "test_process",
-                "message": "continue"
+                "message": "encrypted-send-message"
             })),
         ))
         .await
@@ -1213,7 +1184,8 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
                     if communication.author == AgentPath::root()
                         && communication.recipient.as_str() == "/root/test_process"
                         && communication.other_recipients.is_empty()
-                        && communication.content == "continue"
+                        && communication.content.is_empty()
+                        && communication.encrypted_content.as_deref() == Some("encrypted-send-message")
                         && !communication.trigger_turn
             )
     }));
@@ -1224,7 +1196,7 @@ async fn multi_agent_v2_spawn_rejects_legacy_fork_context() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1264,7 +1236,7 @@ async fn multi_agent_v2_spawn_rejects_invalid_fork_turns_string() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1304,7 +1276,7 @@ async fn multi_agent_v2_spawn_rejects_zero_fork_turns() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1350,7 +1322,7 @@ async fn multi_agent_v2_send_message_accepts_root_target_from_child() {
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1365,8 +1337,7 @@ async fn multi_agent_v2_send_message_accepts_root_target_from_child() {
             vec![UserInput::Text {
                 text: "inspect this repo".to_string(),
                 text_elements: Vec::new(),
-            }]
-            .into(),
+            }],
             Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id: root.thread_id,
                 depth: 1,
@@ -1395,7 +1366,7 @@ async fn multi_agent_v2_send_message_accepts_root_target_from_child() {
             "send_message",
             function_payload(json!({
                 "target": "/root",
-                "message": "done"
+                "message": "encrypted-done"
             })),
         ))
         .await
@@ -1409,7 +1380,8 @@ async fn multi_agent_v2_send_message_accepts_root_target_from_child() {
                     if communication.author == child_path
                         && communication.recipient == AgentPath::root()
                         && communication.other_recipients.is_empty()
-                        && communication.content == "done"
+                        && communication.content.is_empty()
+                        && communication.encrypted_content.as_deref() == Some("encrypted-done")
                         && !communication.trigger_turn
             )
     }));
@@ -1426,7 +1398,7 @@ async fn multi_agent_v2_followup_task_rejects_root_target_from_child() {
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1441,8 +1413,7 @@ async fn multi_agent_v2_followup_task_rejects_root_target_from_child() {
             vec![UserInput::Text {
                 text: "inspect this repo".to_string(),
                 text_elements: Vec::new(),
-            }]
-            .into(),
+            }],
             Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id: root.thread_id,
                 depth: 1,
@@ -1499,11 +1470,11 @@ async fn multi_agent_v2_followup_task_rejects_root_target_from_child() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_list_agents_returns_completed_status_and_last_task_message() {
+async fn multi_agent_v2_list_agents_returns_completed_status() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1538,15 +1509,16 @@ async fn multi_agent_v2_list_agents_returns_completed_status_and_last_task_messa
         .get_thread(agent_id)
         .await
         .expect("child thread should exist");
-    let child_turn = child_thread.codex.session.new_default_turn().await;
+    let child_turn = child_thread.session.new_default_turn().await;
     child_thread
-        .codex
         .session
         .send_event(
             child_turn.as_ref(),
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: child_turn.sub_id.clone(),
+                started_at: None,
                 last_agent_message: Some("done".to_string()),
+                error: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -1573,22 +1545,12 @@ async fn multi_agent_v2_list_agents_returns_completed_status_and_last_task_messa
         .map(|agent| agent.agent_name.as_str())
         .collect::<Vec<_>>();
     assert_eq!(agent_names, vec!["/root", "/root/worker"]);
-    let root_agent = result
-        .agents
-        .iter()
-        .find(|agent| agent.agent_name == "/root")
-        .expect("root agent should be listed");
-    assert_eq!(root_agent.last_task_message.as_deref(), Some("Main thread"));
     let worker = result
         .agents
         .iter()
         .find(|agent| agent.agent_name == "/root/worker")
         .expect("worker agent should be listed");
     assert_eq!(worker.agent_status, json!({"completed": "done"}));
-    assert_eq!(
-        worker.last_task_message.as_deref(),
-        Some("inspect this repo")
-    );
     assert_eq!(success, Some(true));
 }
 
@@ -1600,7 +1562,7 @@ async fn multi_agent_v2_list_agents_filters_by_relative_path_prefix() {
     let _ = config.features.enable(Feature::MultiAgentV2);
     set_turn_config(&mut turn, config.clone());
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1616,8 +1578,7 @@ async fn multi_agent_v2_list_agents_filters_by_relative_path_prefix() {
             vec![UserInput::Text {
                 text: "research".to_string(),
                 text_elements: Vec::new(),
-            }]
-            .into(),
+            }],
             Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id: root.thread_id,
                 depth: 1,
@@ -1637,8 +1598,7 @@ async fn multi_agent_v2_list_agents_filters_by_relative_path_prefix() {
             vec![UserInput::Text {
                 text: "build".to_string(),
                 text_elements: Vec::new(),
-            }]
-            .into(),
+            }],
             Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id: root.thread_id,
                 depth: 2,
@@ -1676,7 +1636,6 @@ async fn multi_agent_v2_list_agents_filters_by_relative_path_prefix() {
 
     assert_eq!(result.agents.len(), 1);
     assert_eq!(result.agents[0].agent_name, worker_path.as_str());
-    assert_eq!(result.agents[0].last_task_message.as_deref(), Some("build"));
 }
 
 #[tokio::test]
@@ -1684,7 +1643,7 @@ async fn multi_agent_v2_list_agents_omits_closed_agents() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1737,10 +1696,78 @@ async fn multi_agent_v2_list_agents_omits_closed_agents() {
 
     assert_eq!(result.agents.len(), 1);
     assert_eq!(result.agents[0].agent_name, "/root");
-    assert_eq!(
-        result.agents[0].last_task_message.as_deref(),
-        Some("Main thread")
-    );
+}
+
+#[tokio::test]
+async fn multi_agent_v2_list_agents_keeps_interrupted_resident_agents() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    set_turn_config(&mut turn, config);
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let spawn_output = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "task_name": "worker"
+            })),
+        ))
+        .await
+        .expect("spawn_agent should succeed");
+    let _ = expect_text_output(spawn_output);
+
+    let agent_id = session
+        .services
+        .agent_control
+        .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
+        .await
+        .expect("worker path should resolve");
+    let agent_path = session
+        .services
+        .agent_control
+        .get_agent_metadata(agent_id)
+        .expect("worker metadata should exist")
+        .agent_path
+        .expect("worker path should exist");
+    let interrupt_output = InterruptAgentHandler
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "interrupt_agent",
+            function_payload(json!({"target": "worker"})),
+        ))
+        .await
+        .expect("interrupt_agent should succeed");
+    let _ = expect_text_output(interrupt_output);
+
+    let output = ListAgentsHandlerV2
+        .handle(invocation(
+            session,
+            turn,
+            "list_agents",
+            function_payload(json!({})),
+        ))
+        .await
+        .expect("list_agents should succeed");
+    let (content, _) = expect_text_output(output);
+    let result: ListAgentsResult =
+        serde_json::from_str(&content).expect("list_agents result should be json");
+
+    assert_eq!(result.agents.len(), 2);
+    assert_eq!(result.agents[0].agent_name, "/root");
+    assert_eq!(result.agents[1].agent_name, agent_path.as_str());
 }
 
 #[tokio::test]
@@ -1748,7 +1775,7 @@ async fn multi_agent_v2_send_message_rejects_legacy_items_field() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1804,7 +1831,7 @@ async fn multi_agent_v2_send_message_rejects_interrupt_parameter() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -1867,7 +1894,8 @@ async fn multi_agent_v2_send_message_rejects_interrupt_parameter() {
             if communication.author == AgentPath::root()
                 && communication.recipient.as_str() == "/root/worker"
                 && communication.other_recipients.is_empty()
-                && communication.content == "continue"
+                && communication.content.is_empty()
+                && communication.encrypted_content.as_deref() == Some("continue")
                 && !communication.trigger_turn
     )));
 }
@@ -1880,12 +1908,12 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
     let _ = config.features.enable(Feature::MultiAgentV2);
     set_turn_config(&mut turn, config);
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     // Production spawn_agent calls happen after the parent turn has resolved
     // and stored its runtime; mirror that before using the synthetic handler.
-    root.thread.codex.session.new_default_turn().await;
+    root.thread.session.new_default_turn().await;
     session.services.agent_control = manager.agent_control();
     session.thread_id = root.thread_id;
     let session = Arc::new(session);
@@ -1915,15 +1943,16 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
         .expect("worker thread should exist");
     let worker_path = AgentPath::try_from("/root/worker").expect("worker path");
 
-    let first_turn = thread.codex.session.new_default_turn().await;
+    let first_turn = thread.session.new_default_turn().await;
     thread
-        .codex
         .session
         .send_event(
             first_turn.as_ref(),
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: first_turn.sub_id.clone(),
+                started_at: None,
                 last_agent_message: Some("first done".to_string()),
+                error: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -1944,15 +1973,28 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
         .await
         .expect("followup_task should succeed");
 
-    let second_turn = thread.codex.session.new_default_turn().await;
+    assert!(manager.captured_ops().iter().any(|(id, op)| {
+        *id == agent_id
+            && matches!(
+                op,
+                Op::InterAgentCommunication { communication }
+                    if communication.author == AgentPath::root()
+                        && communication.recipient == worker_path
+                        && communication.encrypted_content.as_deref() == Some("continue")
+                        && communication.trigger_turn
+            )
+    }));
+
+    let second_turn = thread.session.new_default_turn().await;
     thread
-        .codex
         .session
         .send_event(
             second_turn.as_ref(),
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: second_turn.sub_id.clone(),
+                started_at: None,
                 last_agent_message: Some("second done".to_string()),
+                error: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -1960,14 +2002,18 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
         )
         .await;
 
-    let first_notification = format_subagent_notification_message(
-        worker_path.as_str(),
+    let first_notification = format_inter_agent_completion_message(
+        AgentPath::root(),
+        worker_path.clone(),
         &AgentStatus::Completed(Some("first done".to_string())),
-    );
-    let second_notification = format_subagent_notification_message(
-        worker_path.as_str(),
+    )
+    .expect("completed status should render");
+    let second_notification = format_inter_agent_completion_message(
+        AgentPath::root(),
+        worker_path.clone(),
         &AgentStatus::Completed(Some("second done".to_string())),
-    );
+    )
+    .expect("completed status should render");
 
     let notifications = timeout(Duration::from_secs(5), async {
         loop {
@@ -2015,7 +2061,7 @@ async fn multi_agent_v2_followup_task_rejects_legacy_items_field() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -2068,7 +2114,7 @@ async fn multi_agent_v2_interrupted_turn_does_not_notify_parent() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -2102,14 +2148,14 @@ async fn multi_agent_v2_interrupted_turn_does_not_notify_parent() {
         .await
         .expect("worker thread should exist");
 
-    let aborted_turn = thread.codex.session.new_default_turn().await;
+    let aborted_turn = thread.session.new_default_turn().await;
     thread
-        .codex
         .session
         .send_event(
             aborted_turn.as_ref(),
             EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(aborted_turn.sub_id.clone()),
+                started_at: None,
                 reason: TurnAbortReason::Interrupted,
                 completed_at: None,
                 duration_ms: None,
@@ -2145,7 +2191,7 @@ async fn multi_agent_v2_spawn_omits_agent_id_when_named() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -2184,7 +2230,7 @@ async fn multi_agent_v2_spawn_surfaces_task_name_validation_errors() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -2238,6 +2284,7 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
                 pattern: "**/.env".to_string(),
             },
             access: FileSystemAccessMode::Deny,
+            missing_path_behavior: None,
         });
     let expected_network_sandbox_policy = NetworkSandboxPolicy::from(&expected_sandbox);
     let expected_permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
@@ -2248,6 +2295,9 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
     turn.approval_policy
         .set(AskForApproval::OnRequest)
         .expect("approval policy should be set");
+    let mut config = (*turn.config).clone();
+    config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    set_turn_config(&mut turn, config);
     turn.permission_profile = expected_permission_profile.clone();
     assert_ne!(
         expected_permission_profile,
@@ -2287,12 +2337,13 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
         .await;
     assert_eq!(snapshot.sandbox_policy(), expected_sandbox);
     assert_eq!(snapshot.approval_policy, AskForApproval::OnRequest);
+    assert_eq!(snapshot.approvals_reviewer, ApprovalsReviewer::AutoReview);
     assert_eq!(snapshot.permission_profile, expected_permission_profile);
     let child_thread = manager
         .get_thread(agent_id)
         .await
         .expect("spawned agent thread should exist");
-    let child_turn = child_thread.codex.session.new_default_turn().await;
+    let child_turn = child_thread.session.new_default_turn().await;
     assert_eq!(
         child_turn.file_system_sandbox_policy(),
         expected_file_system_sandbox_policy
@@ -2399,7 +2450,7 @@ async fn multi_agent_v2_spawn_agent_ignores_configured_max_depth() {
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
     let root = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -2524,7 +2575,7 @@ async fn send_input_interrupts_before_prompt() {
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start thread");
     let agent_id = thread.thread_id;
@@ -2566,7 +2617,7 @@ async fn send_input_accepts_structured_items() {
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start thread");
     let agent_id = thread.thread_id;
@@ -2588,7 +2639,6 @@ async fn send_input_accepts_structured_items() {
         .expect("send_input should succeed");
 
     let expected = Op::UserInput {
-        environments: None,
         items: vec![
             UserInput::Mention {
                 name: "drive".to_string(),
@@ -2663,7 +2713,7 @@ async fn resume_agent_noops_for_active_agent() {
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start thread");
     let agent_id = thread.thread_id;
@@ -2711,9 +2761,11 @@ async fn resume_agent_restores_closed_agent_and_accepts_send_input() {
                     text: "materialized".to_string(),
                 }],
                 phase: None,
+                internal_chat_message_metadata_passthrough: None,
             })]),
             AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
             /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
         )
         .await
         .expect("start thread");
@@ -2867,7 +2919,7 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -3219,7 +3271,7 @@ async fn wait_agent_times_out_when_status_is_not_final() {
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start thread");
     let agent_id = thread.thread_id;
@@ -3262,7 +3314,7 @@ async fn wait_agent_clamps_short_timeouts_to_minimum() {
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start thread");
     let agent_id = thread.thread_id;
@@ -3300,7 +3352,7 @@ async fn wait_agent_returns_final_status_without_timeout() {
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start thread");
     let agent_id = thread.thread_id;
@@ -3350,7 +3402,7 @@ async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -3440,7 +3492,7 @@ async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -3521,7 +3573,7 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -3612,7 +3664,7 @@ async fn multi_agent_v2_wait_agent_does_not_return_completed_content() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -3697,11 +3749,11 @@ async fn multi_agent_v2_wait_agent_does_not_return_completed_content() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_close_agent_accepts_task_name_target() {
+async fn multi_agent_v2_interrupt_agent_accepts_task_name_target() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -3734,29 +3786,77 @@ async fn multi_agent_v2_close_agent_accepts_task_name_target() {
         .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
         .await
         .expect("worker path should resolve");
-
-    let output = CloseAgentHandlerV2
+    let worker_thread = manager
+        .get_thread(agent_id)
+        .await
+        .expect("worker thread should be resident");
+    let worker_session = worker_thread.session.clone();
+    SpawnAgentHandlerV2::default()
         .handle(invocation(
-            session,
-            turn,
-            "close_agent",
+            worker_session.clone(),
+            worker_session.new_default_turn().await,
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect a child task",
+                "task_name": "child"
+            })),
+        ))
+        .await
+        .expect("child spawn should succeed");
+    let child_id = session
+        .services
+        .agent_control
+        .resolve_agent_reference(session.thread_id, &turn.session_source, "worker/child")
+        .await
+        .expect("child path should resolve");
+
+    let output = InterruptAgentHandler
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "interrupt_agent",
             function_payload(json!({"target": "worker"})),
         ))
         .await
-        .expect("close_agent should succeed for v2 task names");
+        .expect("interrupt_agent should succeed for v2 task names");
     let (content, success) = expect_text_output(output);
-    let result: close_agent::CloseAgentResult =
-        serde_json::from_str(&content).expect("close_agent result should be json");
+    let result: InterruptAgentResult =
+        serde_json::from_str(&content).expect("interrupt_agent result should be json");
     assert_ne!(result.previous_status, AgentStatus::NotFound);
     assert_eq!(success, Some(true));
     assert_eq!(
-        manager.agent_control().get_status(agent_id).await,
-        AgentStatus::NotFound
+        session
+            .services
+            .agent_control
+            .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
+            .await
+            .expect("worker path should remain resolvable"),
+        agent_id
+    );
+    manager
+        .get_thread(agent_id)
+        .await
+        .expect("worker should remain resident");
+    manager
+        .get_thread(child_id)
+        .await
+        .expect("child should remain resident");
+    let ops = manager.captured_ops();
+    assert!(
+        ops.iter()
+            .any(|(thread_id, op)| *thread_id == agent_id && matches!(op, Op::Interrupt))
+    );
+    assert!(!ops.iter().any(|(thread_id, op)| {
+        (*thread_id == agent_id || *thread_id == child_id) && matches!(op, Op::Shutdown)
+    }));
+    assert!(
+        !ops.iter()
+            .any(|(thread_id, op)| *thread_id == child_id && matches!(op, Op::Interrupt))
     );
 }
 
 #[tokio::test]
-async fn multi_agent_v2_close_agent_reaps_stale_task_name_target() {
+async fn multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target() {
     let (mut session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
     config.multi_agent_v2.max_concurrent_threads_per_session = 2;
@@ -3779,7 +3879,7 @@ async fn multi_agent_v2_close_agent_reaps_stale_task_name_target() {
         Some(state_db.clone()),
     );
     let root = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -3817,18 +3917,18 @@ async fn multi_agent_v2_close_agent_reaps_stale_task_name_target() {
         .expect("removed worker thread should still accept shutdown");
     stale_thread.wait_until_terminated().await;
 
-    let output = CloseAgentHandlerV2
+    let output = InterruptAgentHandler
         .handle(invocation(
             session.clone(),
             turn.clone(),
-            "close_agent",
+            "interrupt_agent",
             function_payload(json!({"target": "worker"})),
         ))
         .await
-        .expect("close_agent should reap stale v2 task names");
+        .expect("interrupt_agent should accept unloaded v2 task names");
     let (content, success) = expect_text_output(output);
-    let result: close_agent::CloseAgentResult =
-        serde_json::from_str(&content).expect("close_agent result should be json");
+    let result: InterruptAgentResult =
+        serde_json::from_str(&content).expect("interrupt_agent result should be json");
     assert_eq!(result.previous_status, AgentStatus::NotFound);
     assert_eq!(success, Some(true));
 
@@ -3839,7 +3939,7 @@ async fn multi_agent_v2_close_agent_reaps_stale_task_name_target() {
         )
         .await
         .expect("open children should load");
-    assert_eq!(open_children, Vec::<ThreadId>::new());
+    assert_eq!(open_children, vec![agent_id]);
     let closed_children = state_db
         .list_thread_spawn_children_with_status(
             root.thread_id,
@@ -3847,40 +3947,30 @@ async fn multi_agent_v2_close_agent_reaps_stale_task_name_target() {
         )
         .await
         .expect("closed children should load");
-    assert_eq!(closed_children, vec![agent_id]);
+    assert_eq!(closed_children, Vec::<ThreadId>::new());
 
-    SpawnAgentHandlerV2::default()
+    let output = ListAgentsHandlerV2
         .handle(invocation(
             session.clone(),
             turn.clone(),
-            "spawn_agent",
-            function_payload(json!({
-                "message": "inspect this repo again",
-                "task_name": "replacement"
-            })),
+            "list_agents",
+            function_payload(json!({})),
         ))
         .await
-        .expect("spawn_agent should succeed after stale close releases the slot");
-    let replacement_id = session
-        .services
-        .agent_control
-        .resolve_agent_reference(session.thread_id, &turn.session_source, "replacement")
-        .await
-        .expect("replacement path should resolve");
-    let _ = session
-        .services
-        .agent_control
-        .shutdown_live_agent(replacement_id)
-        .await
-        .expect("replacement should shut down");
+        .expect("list_agents should succeed");
+    let (content, _) = expect_text_output(output);
+    let result: ListAgentsResult =
+        serde_json::from_str(&content).expect("list_agents result should be json");
+    assert_eq!(result.agents.len(), 1);
+    assert_eq!(result.agents[0].agent_name, "/root");
 }
 
 #[tokio::test]
-async fn multi_agent_v2_close_agent_rejects_root_target_and_id() {
+async fn multi_agent_v2_interrupt_agent_rejects_root_target_and_id() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -3894,31 +3984,31 @@ async fn multi_agent_v2_close_agent_rejects_root_target_and_id() {
 
     let session = Arc::new(session);
     let turn = Arc::new(turn);
-    let root_path_error = CloseAgentHandlerV2
+    let root_path_error = InterruptAgentHandler
         .handle(invocation(
             session.clone(),
             turn.clone(),
-            "close_agent",
+            "interrupt_agent",
             function_payload(json!({"target": "/root"})),
         ))
         .await
         .err()
-        .expect("close_agent should reject the root path");
+        .expect("interrupt_agent should reject the root path");
     assert_eq!(
         root_path_error,
         FunctionCallError::RespondToModel("root is not a spawned agent".to_string())
     );
 
-    let root_id_error = CloseAgentHandlerV2
+    let root_id_error = InterruptAgentHandler
         .handle(invocation(
             session,
             turn,
-            "close_agent",
+            "interrupt_agent",
             function_payload(json!({"target": root.thread_id.to_string()})),
         ))
         .await
         .err()
-        .expect("close_agent should reject the root thread id");
+        .expect("interrupt_agent should reject the root thread id");
     assert_eq!(
         root_id_error,
         FunctionCallError::RespondToModel("root is not a spawned agent".to_string())
@@ -3926,7 +4016,7 @@ async fn multi_agent_v2_close_agent_rejects_root_target_and_id() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_close_agent_rejects_self_target_by_id() {
+async fn multi_agent_v2_interrupt_agent_rejects_self_target_by_id() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let mut config = (*turn.config).clone();
@@ -3936,7 +4026,7 @@ async fn multi_agent_v2_close_agent_rejects_self_target_by_id() {
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -3951,8 +4041,7 @@ async fn multi_agent_v2_close_agent_rejects_self_target_by_id() {
             vec![UserInput::Text {
                 text: "inspect this repo".to_string(),
                 text_elements: Vec::new(),
-            }]
-            .into(),
+            }],
             Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id: root.thread_id,
                 depth: 1,
@@ -3974,27 +4063,27 @@ async fn multi_agent_v2_close_agent_rejects_self_target_by_id() {
         agent_role: None,
     });
 
-    let err = CloseAgentHandlerV2
+    let err = InterruptAgentHandler
         .handle(invocation(
             Arc::new(session),
             Arc::new(turn),
-            "close_agent",
+            "interrupt_agent",
             function_payload(json!({"target": child_thread_id.to_string()})),
         ))
         .await
         .err()
-        .expect("close_agent should reject self-target by id");
+        .expect("interrupt_agent should reject self-target by id");
     assert_eq!(
         err,
         FunctionCallError::RespondToModel(
-            "an agent cannot close itself; return your result and let the parent close you if needed"
+            "an agent cannot interrupt itself; return your result and let the parent interrupt you if needed"
                 .to_string()
         )
     );
 }
 
 #[tokio::test]
-async fn multi_agent_v2_close_agent_rejects_self_target_by_task_name() {
+async fn multi_agent_v2_interrupt_agent_rejects_self_target_by_task_name() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let mut config = (*turn.config).clone();
@@ -4004,7 +4093,7 @@ async fn multi_agent_v2_close_agent_rejects_self_target_by_task_name() {
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
@@ -4019,8 +4108,7 @@ async fn multi_agent_v2_close_agent_rejects_self_target_by_task_name() {
             vec![UserInput::Text {
                 text: "inspect this repo".to_string(),
                 text_elements: Vec::new(),
-            }]
-            .into(),
+            }],
             Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id: root.thread_id,
                 depth: 1,
@@ -4042,20 +4130,20 @@ async fn multi_agent_v2_close_agent_rejects_self_target_by_task_name() {
         agent_role: None,
     });
 
-    let err = CloseAgentHandlerV2
+    let err = InterruptAgentHandler
         .handle(invocation(
             Arc::new(session),
             Arc::new(turn),
-            "close_agent",
+            "interrupt_agent",
             function_payload(json!({"target": child_path.to_string()})),
         ))
         .await
         .err()
-        .expect("close_agent should reject self-target by task name");
+        .expect("interrupt_agent should reject self-target by task name");
     assert_eq!(
         err,
         FunctionCallError::RespondToModel(
-            "an agent cannot close itself; return your result and let the parent close you if needed"
+            "an agent cannot interrupt itself; return your result and let the parent interrupt you if needed"
                 .to_string()
         )
     );
@@ -4068,7 +4156,7 @@ async fn close_agent_submits_shutdown_and_returns_previous_status() {
     session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start thread");
     let agent_id = thread.thread_id;
@@ -4110,25 +4198,30 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
         .enable(Feature::Sqlite)
         .expect("test config should allow sqlite");
     let state_db = init_state_db(&config).await;
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
     let manager = ThreadManager::new(
         &config,
-        AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
+        auth_manager.clone(),
+        crate::thread_manager::build_models_manager(&config, auth_manager),
+        crate::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
         thread_store_from_config(&config, state_db.clone()),
-        state_db.clone(),
+        local_agent_graph_store_from_state_db(state_db.as_ref()),
         "11111111-1111-4111-8111-111111111111".to_string(),
         /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
     );
 
     let parent = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("parent thread should start");
     let parent_thread_id = parent.thread_id;
-    let parent_session = parent.thread.codex.session.clone();
+    let parent_session = parent.thread.session.clone();
 
     let child_turn = parent_session.new_default_turn().await;
     let child_spawn_output = SpawnAgentHandler::default()
@@ -4155,7 +4248,7 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
         .get_thread(child_thread_id)
         .await
         .expect("child thread should exist");
-    let child_session = child_thread.codex.session.clone();
+    let child_session = child_thread.session.clone();
     let grandchild_spawn_output = SpawnAgentHandler::default()
         .handle(invocation(
             child_session.clone(),
@@ -4256,10 +4349,10 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     );
 
     let operator = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("operator thread should start");
-    let operator_session = operator.thread.codex.session.clone();
+    let operator_session = operator.thread.session.clone();
     let _ = manager
         .agent_control()
         .shutdown_live_agent(parent_thread_id)
@@ -4273,7 +4366,7 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     let parent_resume_output = ResumeAgentHandler
         .handle(invocation(
             operator_session,
-            operator.thread.codex.session.new_default_turn().await,
+            operator.thread.session.new_default_turn().await,
             "resume_agent",
             function_payload(json!({"id": parent_thread_id.to_string()})),
         ))
@@ -4337,17 +4430,19 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
         text: "base".to_string(),
     };
     turn.developer_instructions = Some("dev".to_string());
-    turn.compact_prompt = Some("compact".to_string());
-    turn.shell_environment_policy = ShellEnvironmentPolicy {
+    let mut config = (*turn.config).clone();
+    config.compact_prompt = Some("compact".to_string());
+    config.permissions.shell_environment_policy = ShellEnvironmentPolicy {
         use_profile: true,
         ..ShellEnvironmentPolicy::default()
     };
+    config.codex_linux_sandbox_exe = Some(PathBuf::from("/bin/echo"));
+    turn.config = Arc::new(config);
     let temp_dir = tempfile::tempdir().expect("temp dir");
     #[allow(deprecated)]
     {
         turn.cwd = temp_dir.abs();
     }
-    turn.codex_linux_sandbox_exe = Some(PathBuf::from("/bin/echo"));
     #[allow(deprecated)]
     let turn_cwd = turn.cwd.clone();
     let sandbox_policy = pick_allowed_sandbox_policy(
@@ -4373,12 +4468,9 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
     expected.base_instructions = Some(base_instructions.text);
     expected.model = Some(turn.model_info.slug.clone());
     expected.model_provider = turn.provider.info().clone();
-    expected.model_reasoning_effort = turn.reasoning_effort;
+    expected.model_reasoning_effort = turn.reasoning_effort.clone();
     expected.model_reasoning_summary = Some(turn.reasoning_summary);
     expected.developer_instructions = turn.developer_instructions.clone();
-    expected.compact_prompt = turn.compact_prompt.clone();
-    expected.permissions.shell_environment_policy = turn.shell_environment_policy.clone();
-    expected.codex_linux_sandbox_exe = turn.codex_linux_sandbox_exe.clone();
     #[allow(deprecated)]
     {
         expected.cwd = turn.cwd.clone();
@@ -4393,22 +4485,6 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
         .set_permission_profile(permission_profile)
         .expect("permission profile set");
     assert_eq!(config, expected);
-}
-
-#[tokio::test]
-async fn build_agent_spawn_config_preserves_base_user_instructions() {
-    let (_session, mut turn) = make_session_and_context().await;
-    let mut base_config = (*turn.config).clone();
-    base_config.user_instructions = Some("base-user".to_string());
-    turn.user_instructions = Some("resolved-user".to_string());
-    turn.config = Arc::new(base_config.clone());
-    let base_instructions = BaseInstructions {
-        text: "base".to_string(),
-    };
-
-    let config = build_agent_spawn_config(&base_instructions, &turn).expect("spawn config");
-
-    assert_eq!(config.user_instructions, base_config.user_instructions);
 }
 
 #[tokio::test]
@@ -4427,12 +4503,9 @@ async fn build_agent_resume_config_clears_base_instructions() {
     expected.base_instructions = None;
     expected.model = Some(turn.model_info.slug.clone());
     expected.model_provider = turn.provider.info().clone();
-    expected.model_reasoning_effort = turn.reasoning_effort;
+    expected.model_reasoning_effort = turn.reasoning_effort.clone();
     expected.model_reasoning_summary = Some(turn.reasoning_summary);
     expected.developer_instructions = turn.developer_instructions.clone();
-    expected.compact_prompt = turn.compact_prompt.clone();
-    expected.permissions.shell_environment_policy = turn.shell_environment_policy.clone();
-    expected.codex_linux_sandbox_exe = turn.codex_linux_sandbox_exe.clone();
     #[allow(deprecated)]
     {
         expected.cwd = turn.cwd.clone();

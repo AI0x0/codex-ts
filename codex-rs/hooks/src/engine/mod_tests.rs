@@ -66,6 +66,7 @@ fn pre_tool_use_hook_events(command: impl Into<String>) -> HookEventsToml {
                 timeout_sec: Some(10),
                 r#async: false,
                 status_message: Some("checking".to_string()),
+                additional_context_limit: None,
             }],
         }],
         ..Default::default()
@@ -173,6 +174,7 @@ with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
                     timeout_sec: Some(10),
                     r#async: false,
                     status_message: Some("checking".to_string()),
+                    additional_context_limit: None,
                 }],
             }],
             ..Default::default()
@@ -279,6 +281,7 @@ async fn requirements_managed_hooks_execute_windows_command_override() {
                     timeout_sec: Some(10),
                     r#async: false,
                     status_message: Some("checking".to_string()),
+                    additional_context_limit: None,
                 }],
             }],
             ..Default::default()
@@ -358,6 +361,7 @@ fn unknown_requirement_source_hooks_stay_managed() {
                     timeout_sec: Some(10),
                     r#async: false,
                     status_message: Some("checking".to_string()),
+                    additional_context_limit: None,
                 }],
             }],
             ..Default::default()
@@ -426,6 +430,7 @@ fn user_disablement_filters_non_managed_hooks_but_not_managed_hooks() {
                     timeout_sec: Some(10),
                     r#async: false,
                     status_message: Some("checking".to_string()),
+                    additional_context_limit: None,
                 }],
             }],
             ..Default::default()
@@ -667,6 +672,7 @@ fn requirements_managed_hooks_load_when_managed_dir_is_missing() {
                     timeout_sec: Some(10),
                     r#async: false,
                     status_message: Some("checking".to_string()),
+                    additional_context_limit: None,
                 }],
             }],
             ..Default::default()
@@ -1134,6 +1140,153 @@ fn discovers_hooks_from_json_and_toml_in_the_same_layer() {
     assert_eq!(preview[1].source_path, config_path);
 }
 
+#[test]
+fn profile_user_layers_load_shared_hooks_json_once() {
+    let temp = tempdir().expect("create temp dir");
+    let config_path =
+        AbsolutePathBuf::try_from(temp.path().join("config.toml")).expect("absolute config path");
+    let profile_path = AbsolutePathBuf::try_from(temp.path().join("work.config.toml"))
+        .expect("absolute profile path");
+    let hooks_json_path =
+        AbsolutePathBuf::try_from(temp.path().join("hooks.json")).expect("absolute hooks path");
+    fs::write(
+        hooks_json_path.as_path(),
+        r#"{
+              "hooks": {
+                "PreToolUse": [
+                  {
+                    "matcher": "^Bash$",
+                    "hooks": [
+                      {
+                        "type": "command",
+                        "command": "python3 /tmp/json-hook.py"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }"#,
+    )
+    .expect("write hooks.json");
+    let config_layer_stack = ConfigLayerStack::new(
+        vec![
+            ConfigLayerEntry::new(
+                ConfigLayerSource::User {
+                    file: config_path,
+                    profile: None,
+                },
+                TomlValue::Table(Default::default()),
+            ),
+            ConfigLayerEntry::new(
+                ConfigLayerSource::User {
+                    file: profile_path,
+                    profile: Some("work".to_string()),
+                },
+                TomlValue::Table(Default::default()),
+            ),
+        ],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("config layer stack");
+
+    let engine = ClaudeHooksEngine::new(
+        /*enabled*/ true,
+        /*bypass_hook_trust*/ true,
+        Some(&config_layer_stack),
+        Vec::new(),
+        Vec::new(),
+        CommandShell {
+            program: String::new(),
+            args: Vec::new(),
+        },
+    );
+
+    assert!(engine.warnings().is_empty());
+    assert_eq!(engine.handlers.len(), 1);
+    let preview = engine.preview_pre_tool_use(&PreToolUseRequest {
+        session_id: ThreadId::new(),
+        turn_id: "turn-1".to_string(),
+        subagent: None,
+        cwd: cwd(),
+        transcript_path: None,
+        model: "gpt-test".to_string(),
+        permission_mode: "default".to_string(),
+        tool_name: "Bash".to_string(),
+        matcher_aliases: Vec::new(),
+        tool_use_id: "tool-1".to_string(),
+        tool_input: serde_json::json!({ "command": "echo hello" }),
+    });
+    assert_eq!(preview.len(), 1);
+    assert_eq!(preview[0].source_path, hooks_json_path);
+
+    let listed = crate::list_hooks(crate::HooksConfig {
+        feature_enabled: true,
+        bypass_hook_trust: true,
+        config_layer_stack: Some(config_layer_stack),
+        ..Default::default()
+    });
+    assert!(listed.warnings.is_empty());
+    assert_eq!(listed.hooks.len(), 1);
+    assert_eq!(listed.hooks[0].source_path, hooks_json_path);
+}
+
+#[test]
+fn malformed_hooks_json_is_reported_as_startup_warning() {
+    let temp = tempdir().expect("create temp dir");
+    let config_path =
+        AbsolutePathBuf::try_from(temp.path().join("config.toml")).expect("absolute config path");
+    let hooks_json_path =
+        AbsolutePathBuf::try_from(temp.path().join("hooks.json")).expect("absolute hooks path");
+    fs::write(
+        hooks_json_path.as_path(),
+        r#"{
+          "SessionStart": [
+            {
+              "hooks": [
+                {
+                  "type": "command",
+                  "command": "python3 /tmp/session-start.py"
+                }
+              ]
+            }
+          ]
+        }"#,
+    )
+    .expect("write hooks.json");
+    let config_layer_stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::System { file: config_path },
+            TomlValue::Table(Default::default()),
+        )],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("config layer stack");
+
+    let engine = ClaudeHooksEngine::new(
+        /*enabled*/ true,
+        /*bypass_hook_trust*/ false,
+        Some(&config_layer_stack),
+        Vec::new(),
+        Vec::new(),
+        CommandShell {
+            program: String::new(),
+            args: Vec::new(),
+        },
+    );
+
+    assert!(engine.handlers.is_empty());
+    assert_eq!(engine.warnings().len(), 1);
+    assert!(engine.warnings()[0].contains("failed to parse hooks config"));
+    assert!(
+        engine.warnings()[0].contains(&hooks_json_path.display().to_string()),
+        "warning should identify the malformed file: {}",
+        engine.warnings()[0]
+    );
+    assert!(engine.warnings()[0].contains("unknown field `SessionStart`"));
+}
+
 #[tokio::test]
 async fn plugin_hook_sources_run_with_plugin_env_and_plugin_source() {
     let temp = tempdir().expect("create temp dir");
@@ -1173,6 +1326,7 @@ print(json.dumps({
                     timeout_sec: Some(10),
                     r#async: false,
                     status_message: None,
+                    additional_context_limit: None,
                 }],
             }],
             ..Default::default()
@@ -1292,6 +1446,7 @@ fn plugin_hook_sources_expand_plugin_placeholders() {
                     timeout_sec: Some(5),
                     r#async: false,
                     status_message: None,
+                    additional_context_limit: None,
                 }],
             }],
             ..Default::default()

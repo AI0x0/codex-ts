@@ -125,7 +125,21 @@ impl Default for CrosstermEventSource {
 
 impl EventSource for CrosstermEventSource {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<EventResult>> {
-        Pin::new(&mut self.get_mut().0).poll_next(cx)
+        // Crossterm's Windows backend expects Win32 input records. If VT input is inherited or
+        // restored by another console client, navigation keys arrive as literal escape bytes.
+        #[cfg(windows)]
+        let _ = super::windows_console::ensure_input_record_mode();
+
+        let result = Pin::new(&mut self.get_mut().0).poll_next(cx);
+
+        // EventStream starts its blocking reader before returning Pending, so reassert the mode
+        // after that transition as well.
+        #[cfg(windows)]
+        if result.is_pending() {
+            let _ = super::windows_console::ensure_input_record_mode();
+        }
+
+        result
     }
 }
 
@@ -239,7 +253,16 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
             Event::Key(key_event) => {
                 #[cfg(unix)]
                 if crate::tui::job_control::SUSPEND_KEY.is_press(key_event) {
-                    let _ = self.suspend_context.suspend(&self.alt_screen_active);
+                    self.broker.pause_events();
+                    let suspend_result = self.suspend_context.suspend(&self.alt_screen_active);
+                    self.broker.resume_events();
+                    if let Err(err) = suspend_result {
+                        tracing::warn!(
+                            event = "tui_suspend_failed",
+                            error = %err,
+                            "failed to suspend TUI process"
+                        );
+                    }
                     return Some(TuiEvent::Draw);
                 }
                 Some(TuiEvent::Key(key_event))
@@ -248,7 +271,8 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
             Event::Paste(pasted) => Some(TuiEvent::Paste(pasted)),
             Event::FocusGained => {
                 self.terminal_focused.store(true, Ordering::Relaxed);
-                crate::terminal_palette::requery_default_colors();
+                // Keep the startup-cached palette: querying terminal colors here blocks the
+                // input loop, and a direct probe would discard keys typed during the refresh.
                 Some(TuiEvent::Draw)
             }
             Event::FocusLost => {
@@ -405,6 +429,36 @@ mod tests {
                 assert_eq!(key, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
             }
             other => panic!("expected key event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn focus_gained_preserves_already_queued_key() {
+        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        terminal_focused.store(false, Ordering::Relaxed);
+        let mut stream = make_stream(broker.clone(), draw_rx, terminal_focused.clone());
+        let expected_key = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE);
+
+        handle.send(Ok(Event::FocusGained));
+        handle.send(Ok(Event::Key(expected_key)));
+
+        assert!(matches!(stream.next().await, Some(TuiEvent::Draw)));
+        assert!(terminal_focused.load(Ordering::Relaxed));
+        assert!(matches!(
+            &*broker
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            EventBrokerState::Running(_)
+        ));
+
+        let next = timeout(Duration::from_millis(/*millis*/ 100), stream.next())
+            .await
+            .expect("focus handling discarded an already queued key");
+
+        match next {
+            Some(TuiEvent::Key(key)) => assert_eq!(key, expected_key),
+            other => panic!("expected queued key event, got {other:?}"),
         }
     }
 

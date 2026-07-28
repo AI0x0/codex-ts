@@ -3,23 +3,31 @@ use anyhow::Result;
 use base64::Engine;
 use chrono::Duration;
 use chrono::Utc;
-use codex_app_server_protocol::AuthMode;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
+use codex_http_client::cache_system_proxy_route_for_test;
 use codex_login::AuthDotJson;
+use codex_login::AuthKeyringBackendKind;
 use codex_login::AuthManager;
+use codex_login::CLIENT_ID_OVERRIDE_ENV_VAR;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_login::RefreshTokenError;
 use codex_login::load_auth_dot_json;
 use codex_login::save_auth;
 use codex_login::token_data::IdTokenInfo;
 use codex_login::token_data::TokenData;
+use codex_protocol::auth::AuthMode;
 use codex_protocol::auth::RefreshTokenFailedReason;
 use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
 use serde::Serialize;
 use serde_json::json;
 use std::ffi::OsString;
+use std::net::TcpListener;
+use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use tempfile::TempDir;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -29,12 +37,154 @@ use wiremock::matchers::path;
 
 const INITIAL_ACCESS_TOKEN: &str = "initial-access-token";
 const INITIAL_REFRESH_TOKEN: &str = "initial-refresh-token";
+const SYSTEM_PROXY_TEST_ENDPOINT: &str = "http://auth-proxy.invalid/oauth/token";
+const SYSTEM_PROXY_TEST_SUBPROCESS_ENV_VAR: &str = "CODEX_AUTH_SYSTEM_PROXY_TEST_SUBPROCESS";
+const SYSTEM_PROXY_TEST_PROXY_URL_ENV_VAR: &str = "CODEX_AUTH_SYSTEM_PROXY_TEST_PROXY_URL";
+const SYSTEM_PROXY_TEST_NAME: &str =
+    "suite::auth_refresh::refresh_token_honors_respect_system_proxy";
+const PROXY_ENV_KEYS: [&str; 8] = [
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+];
 
-#[serial_test::serial(auth_refresh)]
+#[serial_test::serial(auth_env)]
+#[tokio::test]
+async fn refresh_token_honors_respect_system_proxy() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    if std::env::var_os(SYSTEM_PROXY_TEST_SUBPROCESS_ENV_VAR).is_none() {
+        let response_body =
+            r#"{"access_token":"new-access-token","refresh_token":"new-refresh-token"}"#;
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let proxy_address = listener.local_addr()?;
+        let proxy = tiny_http::Server::from_listener(listener, None)
+            .map_err(|error| anyhow::anyhow!("failed to start auth proxy: {error}"))?;
+        let proxy_thread = std::thread::spawn(move || {
+            let mut request = proxy
+                .recv_timeout(StdDuration::from_secs(30))
+                .expect("proxy should receive an auth refresh request")
+                .expect("proxy should receive a request before the timeout");
+            let request_line = format!("{} {} HTTP/1.1", request.method(), request.url());
+            let mut request_body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut request_body)
+                .expect("proxy should read request body");
+            let content_type = tiny_http::Header::from_bytes(
+                b"Content-Type".as_slice(),
+                b"application/json".as_slice(),
+            )
+            .expect("content type header should be valid");
+            request
+                .respond(tiny_http::Response::from_string(response_body).with_header(content_type))
+                .expect("proxy should write response");
+            (request_line, request_body)
+        });
+
+        let proxy_url = format!("http://{proxy_address}");
+        let mut command = Command::new(std::env::current_exe()?);
+        command.arg("--exact").arg(SYSTEM_PROXY_TEST_NAME);
+        for key in PROXY_ENV_KEYS {
+            command.env_remove(key);
+        }
+        command
+            .env(SYSTEM_PROXY_TEST_SUBPROCESS_ENV_VAR, "1")
+            .env(SYSTEM_PROXY_TEST_PROXY_URL_ENV_VAR, proxy_url)
+            .env(CLIENT_ID_OVERRIDE_ENV_VAR, "staging-client")
+            .env_remove(REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR);
+
+        let output = command.output()?;
+        assert!(
+            output.status.success(),
+            "subprocess test `{SYSTEM_PROXY_TEST_NAME}` failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let (proxy_request_line, proxy_request_body) = proxy_thread
+            .join()
+            .expect("proxy thread should finish after the child test");
+        assert_eq!(
+            proxy_request_line,
+            "POST http://auth-proxy.invalid/oauth/token HTTP/1.1"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&proxy_request_body)?,
+            json!({
+                "client_id": "staging-client",
+                "grant_type": "refresh_token",
+                "refresh_token": INITIAL_REFRESH_TOKEN,
+            })
+        );
+        return Ok(());
+    }
+
+    let codex_home = TempDir::new()?;
+    let proxy_url = std::env::var(SYSTEM_PROXY_TEST_PROXY_URL_ENV_VAR)
+        .context("proxy URL should be set in the auth refresh test subprocess")?;
+    cache_system_proxy_route_for_test(SYSTEM_PROXY_TEST_ENDPOINT, proxy_url);
+    let _endpoint_guard = EnvGuard::set(
+        REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
+        SYSTEM_PROXY_TEST_ENDPOINT.to_string(),
+    );
+    let auth_manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        /*auth_route_config*/
+        codex_login::AuthRouteConfig::from_http_client_factory(HttpClientFactory::new(
+            OutboundProxyPolicy::RespectSystemProxy,
+        )),
+    )
+    .await;
+    let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
+    let initial_auth = AuthDotJson {
+        auth_mode: Some(AuthMode::Chatgpt),
+        openai_api_key: None,
+        tokens: Some(initial_tokens.clone()),
+        last_refresh: Some(Utc::now() - Duration::days(1)),
+        agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
+    };
+    save_auth(
+        codex_home.path(),
+        &initial_auth,
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )?;
+    auth_manager.reload().await;
+
+    auth_manager
+        .refresh_token_from_authority()
+        .await
+        .context("refresh should succeed through the configured proxy")?;
+
+    let refreshed_auth = auth_manager.auth().await.context("auth should be cached")?;
+    let expected_tokens = TokenData {
+        access_token: "new-access-token".to_string(),
+        refresh_token: "new-refresh-token".to_string(),
+        ..initial_tokens
+    };
+    assert_eq!(refreshed_auth.get_token_data()?, expected_tokens);
+
+    Ok(())
+}
+
+#[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn refresh_token_succeeds_updates_storage() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
+    let _client_id_guard = EnvGuard::set(CLIENT_ID_OVERRIDE_ENV_VAR, "staging-client".to_string());
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/oauth/token"))
@@ -55,6 +205,8 @@ async fn refresh_token_succeeds_updates_storage() -> Result<()> {
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     ctx.write_auth(&initial_auth).await?;
 
@@ -62,6 +214,16 @@ async fn refresh_token_succeeds_updates_storage() -> Result<()> {
         .refresh_token_from_authority()
         .await
         .context("refresh should succeed")?;
+
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&requests[0].body)?,
+        json!({
+            "client_id": "staging-client",
+            "grant_type": "refresh_token",
+            "refresh_token": INITIAL_REFRESH_TOKEN,
+        })
+    );
 
     let refreshed_tokens = TokenData {
         access_token: "new-access-token".to_string(),
@@ -94,7 +256,7 @@ async fn refresh_token_succeeds_updates_storage() -> Result<()> {
     Ok(())
 }
 
-#[serial_test::serial(auth_refresh)]
+#[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn refresh_token_refreshes_when_auth_is_unchanged() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -119,6 +281,8 @@ async fn refresh_token_refreshes_when_auth_is_unchanged() -> Result<()> {
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     ctx.write_auth(&initial_auth).await?;
 
@@ -158,7 +322,7 @@ async fn refresh_token_refreshes_when_auth_is_unchanged() -> Result<()> {
     Ok(())
 }
 
-#[serial_test::serial(auth_refresh)]
+#[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn auth_refreshes_when_access_token_is_near_expiry() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -184,6 +348,8 @@ async fn auth_refreshes_when_access_token_is_near_expiry() -> Result<()> {
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     ctx.write_auth(&initial_auth).await?;
 
@@ -218,7 +384,7 @@ async fn auth_refreshes_when_access_token_is_near_expiry() -> Result<()> {
     Ok(())
 }
 
-#[serial_test::serial(auth_refresh)]
+#[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn auth_skips_access_token_outside_refresh_window() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -234,6 +400,8 @@ async fn auth_skips_access_token_outside_refresh_window() -> Result<()> {
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     ctx.write_auth(&initial_auth).await?;
 
@@ -254,7 +422,7 @@ async fn auth_skips_access_token_outside_refresh_window() -> Result<()> {
     Ok(())
 }
 
-#[serial_test::serial(auth_refresh)]
+#[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn refresh_token_skips_refresh_when_auth_changed() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -270,6 +438,8 @@ async fn refresh_token_skips_refresh_when_auth_changed() -> Result<()> {
         tokens: Some(initial_tokens),
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     ctx.write_auth(&initial_auth).await?;
 
@@ -280,11 +450,14 @@ async fn refresh_token_skips_refresh_when_auth_changed() -> Result<()> {
         tokens: Some(disk_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     save_auth(
         ctx.codex_home.path(),
         &disk_auth,
         AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
     )?;
 
     ctx.auth_manager
@@ -310,7 +483,7 @@ async fn refresh_token_skips_refresh_when_auth_changed() -> Result<()> {
     Ok(())
 }
 
-#[serial_test::serial(auth_refresh)]
+#[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn refresh_token_errors_on_account_mismatch() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -335,6 +508,8 @@ async fn refresh_token_errors_on_account_mismatch() -> Result<()> {
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     ctx.write_auth(&initial_auth).await?;
 
@@ -346,11 +521,14 @@ async fn refresh_token_errors_on_account_mismatch() -> Result<()> {
         tokens: Some(disk_tokens),
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     save_auth(
         ctx.codex_home.path(),
         &disk_auth,
         AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
     )?;
 
     let err = ctx
@@ -380,7 +558,7 @@ async fn refresh_token_errors_on_account_mismatch() -> Result<()> {
     Ok(())
 }
 
-#[serial_test::serial(auth_refresh)]
+#[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn returns_fresh_tokens_as_is() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -405,6 +583,8 @@ async fn returns_fresh_tokens_as_is() -> Result<()> {
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(stale_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     ctx.write_auth(&initial_auth).await?;
 
@@ -427,7 +607,7 @@ async fn returns_fresh_tokens_as_is() -> Result<()> {
     Ok(())
 }
 
-#[serial_test::serial(auth_refresh)]
+#[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn refreshes_token_when_access_token_is_expired() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -453,6 +633,8 @@ async fn refreshes_token_when_access_token_is_expired() -> Result<()> {
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(fresh_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     ctx.write_auth(&initial_auth).await?;
 
@@ -487,7 +669,7 @@ async fn refreshes_token_when_access_token_is_expired() -> Result<()> {
     Ok(())
 }
 
-#[serial_test::serial(auth_refresh)]
+#[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn auth_reloads_disk_auth_when_cached_auth_is_stale() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -503,6 +685,8 @@ async fn auth_reloads_disk_auth_when_cached_auth_is_stale() -> Result<()> {
         tokens: Some(initial_tokens),
         last_refresh: Some(stale_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     ctx.write_auth(&initial_auth).await?;
 
@@ -514,11 +698,14 @@ async fn auth_reloads_disk_auth_when_cached_auth_is_stale() -> Result<()> {
         tokens: Some(disk_tokens.clone()),
         last_refresh: Some(fresh_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     save_auth(
         ctx.codex_home.path(),
         &disk_auth,
         AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
     )?;
 
     let cached_auth = ctx
@@ -540,7 +727,7 @@ async fn auth_reloads_disk_auth_when_cached_auth_is_stale() -> Result<()> {
     Ok(())
 }
 
-#[serial_test::serial(auth_refresh)]
+#[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn auth_reloads_disk_auth_without_calling_expired_refresh_token() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -566,6 +753,8 @@ async fn auth_reloads_disk_auth_without_calling_expired_refresh_token() -> Resul
         tokens: Some(initial_tokens),
         last_refresh: Some(stale_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     ctx.write_auth(&initial_auth).await?;
 
@@ -577,11 +766,14 @@ async fn auth_reloads_disk_auth_without_calling_expired_refresh_token() -> Resul
         tokens: Some(disk_tokens.clone()),
         last_refresh: Some(fresh_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     save_auth(
         ctx.codex_home.path(),
         &disk_auth,
         AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
     )?;
 
     let cached_auth = ctx
@@ -601,7 +793,7 @@ async fn auth_reloads_disk_auth_without_calling_expired_refresh_token() -> Resul
     Ok(())
 }
 
-#[serial_test::serial(auth_refresh)]
+#[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn refresh_token_returns_permanent_error_for_expired_refresh_token() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -627,6 +819,8 @@ async fn refresh_token_returns_permanent_error_for_expired_refresh_token() -> Re
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     ctx.write_auth(&initial_auth).await?;
 
@@ -654,7 +848,7 @@ async fn refresh_token_returns_permanent_error_for_expired_refresh_token() -> Re
     Ok(())
 }
 
-#[serial_test::serial(auth_refresh)]
+#[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn refresh_token_does_not_retry_after_permanent_failure() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -680,6 +874,8 @@ async fn refresh_token_does_not_retry_after_permanent_failure() -> Result<()> {
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     ctx.write_auth(&initial_auth).await?;
 
@@ -721,7 +917,7 @@ async fn refresh_token_does_not_retry_after_permanent_failure() -> Result<()> {
     Ok(())
 }
 
-#[serial_test::serial(auth_refresh)]
+#[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn refresh_token_does_not_retry_after_bad_request_reused_failure() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -747,6 +943,8 @@ async fn refresh_token_does_not_retry_after_bad_request_reused_failure() -> Resu
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     ctx.write_auth(&initial_auth).await?;
 
@@ -788,7 +986,7 @@ async fn refresh_token_does_not_retry_after_bad_request_reused_failure() -> Resu
     Ok(())
 }
 
-#[serial_test::serial(auth_refresh)]
+#[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn refresh_token_reloads_changed_auth_after_permanent_failure() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -814,6 +1012,8 @@ async fn refresh_token_reloads_changed_auth_after_permanent_failure() -> Result<
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     ctx.write_auth(&initial_auth).await?;
 
@@ -836,11 +1036,14 @@ async fn refresh_token_reloads_changed_auth_after_permanent_failure() -> Result<
         tokens: Some(disk_tokens.clone()),
         last_refresh: Some(fresh_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     save_auth(
         ctx.codex_home.path(),
         &disk_auth,
         AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
     )?;
 
     ctx.auth_manager
@@ -871,7 +1074,7 @@ async fn refresh_token_reloads_changed_auth_after_permanent_failure() -> Result<
     Ok(())
 }
 
-#[serial_test::serial(auth_refresh)]
+#[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn refresh_token_returns_transient_error_on_server_failure() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -895,6 +1098,8 @@ async fn refresh_token_returns_transient_error_on_server_failure() -> Result<()>
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     ctx.write_auth(&initial_auth).await?;
 
@@ -923,7 +1128,7 @@ async fn refresh_token_returns_transient_error_on_server_failure() -> Result<()>
     Ok(())
 }
 
-#[serial_test::serial(auth_refresh)]
+#[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn unauthorized_recovery_reloads_then_refreshes_tokens() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -948,6 +1153,8 @@ async fn unauthorized_recovery_reloads_then_refreshes_tokens() -> Result<()> {
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     ctx.write_auth(&initial_auth).await?;
 
@@ -958,11 +1165,14 @@ async fn unauthorized_recovery_reloads_then_refreshes_tokens() -> Result<()> {
         tokens: Some(disk_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     save_auth(
         ctx.codex_home.path(),
         &disk_auth,
         AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
     )?;
 
     let cached_before = ctx
@@ -1017,7 +1227,7 @@ async fn unauthorized_recovery_reloads_then_refreshes_tokens() -> Result<()> {
     Ok(())
 }
 
-#[serial_test::serial(auth_refresh)]
+#[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn unauthorized_recovery_errors_on_account_mismatch() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1042,6 +1252,8 @@ async fn unauthorized_recovery_errors_on_account_mismatch() -> Result<()> {
         tokens: Some(initial_tokens.clone()),
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     ctx.write_auth(&initial_auth).await?;
 
@@ -1053,11 +1265,14 @@ async fn unauthorized_recovery_errors_on_account_mismatch() -> Result<()> {
         tokens: Some(disk_tokens),
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     save_auth(
         ctx.codex_home.path(),
         &disk_auth,
         AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
     )?;
 
     let cached_before = ctx
@@ -1098,7 +1313,7 @@ async fn unauthorized_recovery_errors_on_account_mismatch() -> Result<()> {
     Ok(())
 }
 
-#[serial_test::serial(auth_refresh)]
+#[serial_test::serial(auth_env)]
 #[tokio::test]
 async fn unauthorized_recovery_requires_chatgpt_auth() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1111,6 +1326,8 @@ async fn unauthorized_recovery_requires_chatgpt_auth() -> Result<()> {
         tokens: None,
         last_refresh: None,
         agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
     };
     ctx.write_auth(&auth).await?;
 
@@ -1147,7 +1364,10 @@ impl RefreshTokenTestContext {
             codex_home.path().to_path_buf(),
             /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
+            /*forced_chatgpt_workspace_id*/ None,
             /*chatgpt_base_url*/ None,
+            AuthKeyringBackendKind::default(),
+            codex_login::test_support::transport_default_auth_route_config(),
         )
         .await;
 
@@ -1159,9 +1379,13 @@ impl RefreshTokenTestContext {
     }
 
     fn load_auth(&self) -> Result<AuthDotJson> {
-        load_auth_dot_json(self.codex_home.path(), AuthCredentialsStoreMode::File)
-            .context("load auth.json")?
-            .context("auth.json should exist")
+        load_auth_dot_json(
+            self.codex_home.path(),
+            AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+        )
+        .context("load auth.json")?
+        .context("auth.json should exist")
     }
 
     async fn write_auth(&self, auth_dot_json: &AuthDotJson) -> Result<()> {
@@ -1169,6 +1393,7 @@ impl RefreshTokenTestContext {
             self.codex_home.path(),
             auth_dot_json,
             AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
         )?;
         self.auth_manager.reload().await;
         Ok(())
@@ -1219,14 +1444,8 @@ fn jwt_with_payload(payload: serde_json::Value) -> String {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
     }
 
-    let header_bytes = match serde_json::to_vec(&header) {
-        Ok(bytes) => bytes,
-        Err(err) => panic!("serialize header: {err}"),
-    };
-    let payload_bytes = match serde_json::to_vec(&payload) {
-        Ok(bytes) => bytes,
-        Err(err) => panic!("serialize payload: {err}"),
-    };
+    let header_bytes = serde_json::to_vec(&header).expect("header should serialize");
+    let payload_bytes = serde_json::to_vec(&payload).expect("payload should serialize");
     let header_b64 = b64(&header_bytes);
     let payload_b64 = b64(&payload_bytes);
     let signature_b64 = b64(b"sig");

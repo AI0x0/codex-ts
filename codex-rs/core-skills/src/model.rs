@@ -1,83 +1,19 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
+use std::io;
 use std::sync::Arc;
 
 use codex_exec_server::ExecutorFileSystem;
+use codex_exec_server::LOCAL_FS;
 use codex_protocol::protocol::Product;
-use codex_protocol::protocol::SkillScope;
+pub use codex_skills::SkillDependencies;
+pub use codex_skills::SkillInterface;
+pub use codex_skills::SkillMetadata;
+pub use codex_skills::SkillPolicy;
+pub use codex_skills::SkillToolDependency;
 use codex_utils_absolute_path::AbsolutePathBuf;
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct SkillMetadata {
-    pub name: String,
-    pub description: String,
-    pub short_description: Option<String>,
-    pub interface: Option<SkillInterface>,
-    pub dependencies: Option<SkillDependencies>,
-    pub policy: Option<SkillPolicy>,
-    /// Path to the SKILLS.md file that declares this skill.
-    pub path_to_skills_md: AbsolutePathBuf,
-    pub scope: SkillScope,
-    pub plugin_id: Option<String>,
-}
-
-impl SkillMetadata {
-    fn allow_implicit_invocation(&self) -> bool {
-        self.policy
-            .as_ref()
-            .and_then(|policy| policy.allow_implicit_invocation)
-            .unwrap_or(true)
-    }
-
-    pub fn matches_product_restriction_for_product(
-        &self,
-        restriction_product: Option<Product>,
-    ) -> bool {
-        match &self.policy {
-            Some(policy) => {
-                policy.products.is_empty()
-                    || restriction_product.is_some_and(|product| {
-                        product.matches_product_restriction(&policy.products)
-                    })
-            }
-            None => true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct SkillPolicy {
-    pub allow_implicit_invocation: Option<bool>,
-    // TODO: Enforce product gating in Codex skill selection/injection instead of only parsing and
-    // storing this metadata.
-    pub products: Vec<Product>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillInterface {
-    pub display_name: Option<String>,
-    pub short_description: Option<String>,
-    pub icon_small: Option<AbsolutePathBuf>,
-    pub icon_large: Option<AbsolutePathBuf>,
-    pub brand_color: Option<String>,
-    pub default_prompt: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillDependencies {
-    pub tools: Vec<SkillToolDependency>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillToolDependency {
-    pub r#type: String,
-    pub value: String,
-    pub description: Option<String>,
-    pub transport: Option<String>,
-    pub command: Option<String>,
-    pub url: Option<String>,
-}
+use codex_utils_path_uri::PathUri;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillError {
@@ -103,7 +39,7 @@ impl SkillLoadOutcome {
     }
 
     pub fn is_skill_allowed_for_implicit_invocation(&self, skill: &SkillMetadata) -> bool {
-        self.is_skill_enabled(skill) && skill.allow_implicit_invocation()
+        self.is_skill_enabled(skill) && skill.allows_implicit_invocation()
     }
 
     pub fn allowed_skills_for_implicit_invocation(&self) -> Vec<SkillMetadata> {
@@ -120,12 +56,43 @@ impl SkillLoadOutcome {
             .map(|skill| (skill, self.is_skill_enabled(skill)))
     }
 
+    /// Returns the discovery root that supplied a loaded skill path.
+    pub fn skill_root_for_path(&self, path: &AbsolutePathBuf) -> Option<&AbsolutePathBuf> {
+        self.skill_root_by_path.get(path)
+    }
+
     pub(crate) fn file_system_for_skill(
         &self,
         skill: &SkillMetadata,
     ) -> Option<Arc<dyn ExecutorFileSystem>> {
         self.file_systems_by_skill_path
             .get(&skill.path_to_skills_md)
+    }
+}
+
+/// Immutable snapshot of host-owned skills and the filesystem mapping needed
+/// to read each skill through the environment that discovered it.
+#[derive(Debug, Clone)]
+pub struct HostSkillsSnapshot {
+    outcome: Arc<SkillLoadOutcome>,
+}
+
+impl HostSkillsSnapshot {
+    pub fn new(outcome: Arc<SkillLoadOutcome>) -> Self {
+        Self { outcome }
+    }
+
+    pub fn outcome(&self) -> &SkillLoadOutcome {
+        self.outcome.as_ref()
+    }
+
+    pub async fn read_skill_text(&self, skill: &SkillMetadata) -> io::Result<String> {
+        let fs = self
+            .outcome
+            .file_system_for_skill(skill)
+            .unwrap_or_else(|| Arc::clone(&LOCAL_FS));
+        let path = PathUri::from_abs_path(&skill.path_to_skills_md);
+        fs.read_file_text(&path, /*sandbox*/ None).await
     }
 }
 

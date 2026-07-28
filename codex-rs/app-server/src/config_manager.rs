@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
 use toml::Value as TomlValue;
+use tracing::instrument;
 use tracing::warn;
 
 /// Shared app-server entry point for loading effective Codex configuration.
@@ -94,9 +95,14 @@ impl ConfigManager {
         &self,
         auth_manager: Arc<AuthManager>,
         chatgpt_base_url: String,
+        http_client_factory: codex_http_client::HttpClientFactory,
     ) {
-        let loader =
-            cloud_config_bundle_loader(auth_manager, chatgpt_base_url, self.codex_home.clone());
+        let loader = cloud_config_bundle_loader(
+            auth_manager,
+            chatgpt_base_url,
+            self.codex_home.clone(),
+            http_client_factory,
+        );
         if let Ok(mut guard) = self.cloud_config_bundle.write() {
             *guard = loader;
         } else {
@@ -176,7 +182,7 @@ impl ConfigManager {
                 &user_config_path,
                 self.loader_overrides.user_config_profile.as_ref(),
                 TomlValue::Table(toml::map::Map::new()),
-            );
+            )?;
         }
         self.apply_runtime_feature_enablement(&mut config);
         self.apply_arg0_paths(&mut config);
@@ -212,6 +218,7 @@ impl ConfigManager {
         .await
     }
 
+    #[instrument(level = "trace", skip_all)]
     pub(crate) async fn load_with_cli_overrides(
         &self,
         cli_overrides: &[(String, TomlValue)],

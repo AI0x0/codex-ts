@@ -13,6 +13,7 @@ use super::MatcherGroup;
 fn hooks_file_deserializes_existing_json_shape() {
     let parsed: HooksFile = serde_json::from_str(
         r#"{
+  "description": "Optional stop-time review gate for Codex Companion.",
   "hooks": {
     "PreToolUse": [
       {
@@ -22,7 +23,8 @@ fn hooks_file_deserializes_existing_json_shape() {
             "type": "command",
             "command": "python3 /tmp/pre.py",
             "timeout": 10,
-            "statusMessage": "checking"
+            "statusMessage": "checking",
+            "additionalContextLimit": 4096
           }
         ]
       }
@@ -35,6 +37,7 @@ fn hooks_file_deserializes_existing_json_shape() {
     assert_eq!(
         parsed,
         HooksFile {
+            description: Some("Optional stop-time review gate for Codex Companion.".to_string()),
             hooks: HookEventsToml {
                 pre_tool_use: vec![MatcherGroup {
                     matcher: Some("^Bash$".to_string()),
@@ -44,11 +47,36 @@ fn hooks_file_deserializes_existing_json_shape() {
                         timeout_sec: Some(10),
                         r#async: false,
                         status_message: Some("checking".to_string()),
+                        additional_context_limit: Some(4096),
                     }],
                 }],
                 ..Default::default()
             },
         }
+    );
+}
+
+#[test]
+fn hooks_file_rejects_events_outside_hooks_object() {
+    let error = serde_json::from_str::<HooksFile>(
+        r#"{
+  "SessionStart": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 /tmp/session_start.py"
+        }
+      ]
+    }
+  ]
+}"#,
+    )
+    .expect_err("root-level hook events should be rejected");
+
+    assert!(
+        error.to_string().contains("unknown field `SessionStart`"),
+        "unexpected parse error: {error}"
     );
 }
 
@@ -64,6 +92,7 @@ type = "command"
 command = "python3 /tmp/pre.py"
 timeout = 10
 statusMessage = "checking"
+additionalContextLimit = 4096
 "#,
     )
     .expect("hook events TOML should deserialize");
@@ -79,6 +108,7 @@ statusMessage = "checking"
                     timeout_sec: Some(10),
                     r#async: false,
                     status_message: Some("checking".to_string()),
+                    additional_context_limit: Some(4096),
                 }],
             }],
             ..Default::default()
@@ -116,6 +146,7 @@ command = "python3 /tmp/pre.py"
                         timeout_sec: None,
                         r#async: false,
                         status_message: None,
+                        additional_context_limit: None,
                     }],
                 }],
                 ..Default::default()
@@ -161,6 +192,7 @@ command = "python3 /enterprise/place/pre.py"
                         timeout_sec: None,
                         r#async: false,
                         status_message: None,
+                        additional_context_limit: None,
                     }],
                 }],
                 ..Default::default()
@@ -197,6 +229,7 @@ command_windows = "powershell -File C:\\enterprise\\hooks\\pre.ps1"
                     timeout_sec: None,
                     r#async: false,
                     status_message: None,
+                    additional_context_limit: None,
                 }],
             }],
             ..Default::default()
@@ -232,9 +265,26 @@ commandWindows = "powershell -File C:\\enterprise\\hooks\\pre.ps1"
                     timeout_sec: None,
                     r#async: false,
                     status_message: None,
+                    additional_context_limit: None,
                 }],
             }],
             ..Default::default()
         }
     );
+}
+
+#[test]
+fn hook_handler_omits_unset_additional_context_limit() {
+    let handler = HookHandlerConfig::Command {
+        command: "python3 /tmp/pre.py".to_string(),
+        command_windows: None,
+        timeout_sec: None,
+        r#async: false,
+        status_message: None,
+        additional_context_limit: None,
+    };
+
+    let serialized = serde_json::to_value(handler).expect("hook handler should serialize");
+
+    assert_eq!(serialized.get("additionalContextLimit"), None);
 }

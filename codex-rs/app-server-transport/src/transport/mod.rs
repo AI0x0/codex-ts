@@ -30,10 +30,16 @@ mod unix_socket;
 mod unix_socket_tests;
 mod websocket;
 
+pub use remote_control::REMOTE_CONTROL_DISABLED_ENV_VAR;
+pub use remote_control::RemoteControlDisabledByRequirements;
+pub use remote_control::RemoteControlEnableError;
 pub use remote_control::RemoteControlHandle;
+pub use remote_control::RemoteControlPolicy;
 pub use remote_control::RemoteControlStartConfig;
+pub use remote_control::RemoteControlStartupMode;
 pub use remote_control::RemoteControlUnavailable;
 pub use remote_control::start_remote_control;
+pub use remote_control::take_remote_control_disabled_env;
 pub use stdio::start_stdio_connection;
 pub use unix_socket::AppServerStartupLock;
 pub use unix_socket::acquire_app_server_startup_lock;
@@ -250,14 +256,7 @@ async fn enqueue_incoming_message(
 }
 
 fn serialize_outgoing_message(outgoing_message: OutgoingMessage) -> Option<String> {
-    let value = match serde_json::to_value(outgoing_message) {
-        Ok(value) => value,
-        Err(err) => {
-            error!("Failed to convert OutgoingMessage to JSON value: {err}");
-            return None;
-        }
-    };
-    match serde_json::to_string(&value) {
+    match serde_json::to_string(&outgoing_message) {
         Ok(json) => Some(json),
         Err(err) => {
             error!("Failed to serialize JSONRPCMessage: {err}");
@@ -275,6 +274,7 @@ mod tests {
     use codex_app_server_protocol::JSONRPCResponse;
     use codex_app_server_protocol::RequestId;
     use codex_app_server_protocol::ServerNotification;
+    use codex_app_server_protocol::ServerNotificationEnvelope;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use tokio::time::Duration;
@@ -285,6 +285,32 @@ mod tests {
         assert_eq!(
             AppServerTransport::from_listen_url("off"),
             Ok(AppServerTransport::Off)
+        );
+    }
+
+    #[test]
+    fn serialize_outgoing_message_preserves_wire_shape() {
+        let message = OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+            notification: ServerNotification::ConfigWarning(ConfigWarningNotification {
+                summary: "summary".to_string(),
+                details: None,
+                path: None,
+                range: None,
+            }),
+            emitted_at_ms: Some(1_234),
+        });
+
+        let json = serialize_outgoing_message(message).expect("message should serialize");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).expect("message should be valid JSON"),
+            json!({
+                "method": "configWarning",
+                "params": {
+                    "summary": "summary",
+                    "details": null,
+                },
+                "emittedAtMs": 1_234,
+            })
         );
     }
 
@@ -437,14 +463,15 @@ mod tests {
 
         writer_tx
             .send(QueuedOutgoingMessage::new(
-                OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                    ConfigWarningNotification {
+                OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+                    notification: ServerNotification::ConfigWarning(ConfigWarningNotification {
                         summary: "queued".to_string(),
                         details: None,
                         path: None,
                         range: None,
-                    },
-                )),
+                    }),
+                    emitted_at_ms: Some(1_234),
+                }),
             ))
             .await
             .expect("writer queue should accept first message");
@@ -478,6 +505,7 @@ mod tests {
                     "summary": "queued",
                     "details": null,
                 },
+                "emittedAtMs": 1_234,
             })
         );
     }

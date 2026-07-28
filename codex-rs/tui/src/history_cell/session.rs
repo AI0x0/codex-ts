@@ -1,6 +1,7 @@
 //! Session headers, onboarding guidance, and transcript cards.
 
 use super::*;
+use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 
 pub(crate) const SESSION_HEADER_MAX_INNER_WIDTH: usize = 56; // Just an eyeballed value
 
@@ -69,13 +70,6 @@ fn with_border_internal(
     out.push(vec![format!("╰{}╯", "─".repeat(border_inner_width)).dim()].into());
 
     out
-}
-
-/// Return the emoji followed by a hair space (U+200A).
-/// Using only the hair space avoids excessive padding after the emoji while
-/// still providing a small visual gap across terminals.
-pub(crate) fn padded_emoji(emoji: &str) -> String {
-    format!("{emoji}\u{200A}")
 }
 
 #[derive(Debug)]
@@ -149,7 +143,7 @@ pub(crate) fn new_session_info(
     // Header box rendered as history (so it appears at the very top)
     let header = SessionHeaderHistoryCell::new(
         session.model.clone(),
-        session.reasoning_effort,
+        session.reasoning_effort.clone(),
         show_fast_status,
         config.cwd.to_path_buf(),
         CODEX_CLI_VERSION,
@@ -317,15 +311,10 @@ impl SessionHeaderHistoryCell {
         formatted
     }
 
-    fn reasoning_label(&self) -> Option<&'static str> {
-        self.reasoning_effort.map(|effort| match effort {
-            ReasoningEffortConfig::Minimal => "minimal",
-            ReasoningEffortConfig::Low => "low",
-            ReasoningEffortConfig::Medium => "medium",
-            ReasoningEffortConfig::High => "high",
-            ReasoningEffortConfig::XHigh => "xhigh",
-            ReasoningEffortConfig::None => "none",
-        })
+    fn reasoning_label(&self) -> Option<&str> {
+        self.reasoning_effort
+            .as_ref()
+            .map(ReasoningEffortConfig::as_str)
     }
 }
 
@@ -368,7 +357,7 @@ impl HistoryCell for SessionHeaderHistoryCell {
             ];
             if let Some(reasoning) = reasoning_label {
                 spans.push(Span::from(" "));
-                spans.push(Span::from(reasoning));
+                spans.push(Span::from(reasoning.to_owned()));
             }
             if self.show_fast_status {
                 spans.push("   ".into());
@@ -402,6 +391,10 @@ impl HistoryCell for SessionHeaderHistoryCell {
             ]));
         }
 
+        let lines = lines
+            .into_iter()
+            .map(|line| truncate_line_with_ellipsis_if_overflow(line, inner_width))
+            .collect();
         with_border(lines)
     }
 

@@ -11,6 +11,7 @@ use crate::outgoing_message::OutgoingNotificationMeta;
 use crate::patch_approval::handle_patch_approval_request;
 use codex_core::CodexThread;
 use codex_core::NewThread;
+use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
 use codex_core::config::Config as CodexConfig;
 use codex_protocol::ThreadId;
@@ -24,7 +25,7 @@ use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::user_input::UserInput;
 use rmcp::model::CallToolResult;
-use rmcp::model::Content;
+use rmcp::model::ContentBlock;
 use rmcp::model::RequestId;
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -39,7 +40,7 @@ pub(crate) fn create_call_tool_result_with_thread_id(
     is_error: Option<bool>,
 ) -> CallToolResult {
     let content_text = text;
-    let content = vec![Content::text(content_text.clone())];
+    let content = vec![ContentBlock::text(content_text.clone())];
     let structured_content = json!({
         "threadId": thread_id,
         "content": content_text,
@@ -66,10 +67,13 @@ pub async fn run_codex_tool_session(
         thread_id,
         thread,
         session_configured,
-    } = match thread_manager.start_thread(config.clone()).await {
+    } = match thread_manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+    {
         Ok(res) => res,
         Err(e) => {
-            let result = CallToolResult::error(vec![Content::text(format!(
+            let result = CallToolResult::error(vec![ContentBlock::text(format!(
                 "Failed to start Codex session: {e}"
             ))]);
             outgoing.send_response(id.clone(), result).await;
@@ -103,7 +107,6 @@ pub async fn run_codex_tool_session(
     let submission = Submission {
         id: sub_id.clone(),
         op: Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: initial_prompt.clone(),
                 // MCP tool prompts are plain text with no UI element ranges.
@@ -155,7 +158,6 @@ pub async fn run_codex_tool_session_reply(
         .insert(request_id.clone(), thread_id);
     if let Err(e) = thread
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: prompt,
                 // MCP tool prompts are plain text with no UI element ranges.
@@ -222,10 +224,13 @@ async fn run_codex_tool_session_inner(
                         let approval_id = ev.effective_approval_id();
                         let ExecApprovalRequestEvent {
                             turn_id: _,
+                            environment_id: _,
                             started_at_ms: _,
                             command,
                             cwd,
                             call_id,
+                            plugin_id: _,
+                            script_path: _,
                             approval_id: _,
                             reason: _,
                             proposed_execpolicy_amendment: _,
@@ -266,7 +271,9 @@ async fn run_codex_tool_session_inner(
                     }
                     EventMsg::Warning(_)
                     | EventMsg::GuardianWarning(_)
-                    | EventMsg::ModelVerification(_) => {
+                    | EventMsg::ModelVerification(_)
+                    | EventMsg::SafetyBuffering(_)
+                    | EventMsg::TurnModerationMetadata(_) => {
                         continue;
                     }
                     EventMsg::GuardianAssessment(_) => {
@@ -332,6 +339,8 @@ async fn run_codex_tool_session_inner(
                     EventMsg::AgentReasoningRawContent(_)
                     | EventMsg::TurnStarted(_)
                     | EventMsg::ThreadSettingsApplied(_)
+                    | EventMsg::EnvironmentConnected(_)
+                    | EventMsg::EnvironmentDisconnected(_)
                     | EventMsg::TokenCount(_)
                     | EventMsg::AgentReasoning(_)
                     | EventMsg::AgentReasoningSectionBreak(_)
@@ -357,6 +366,7 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::ImageGenerationEnd(_)
                     | EventMsg::ViewImageToolCall(_)
                     | EventMsg::RawResponseItem(_)
+                    | EventMsg::RawResponseCompleted(_)
                     | EventMsg::EnteredReviewMode(_)
                     | EventMsg::ItemStarted(_)
                     | EventMsg::ItemCompleted(_)
@@ -383,6 +393,7 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::CollabCloseEnd(_)
                     | EventMsg::CollabResumeBegin(_)
                     | EventMsg::CollabResumeEnd(_)
+                    | EventMsg::SubAgentActivity(_)
                     | EventMsg::RealtimeConversationStarted(_)
                     | EventMsg::RealtimeConversationSdp(_)
                     | EventMsg::RealtimeConversationRealtime(_)
