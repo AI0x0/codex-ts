@@ -6,13 +6,46 @@
  * rather than total context size.
  */
 
+/** mirrors AutoCompactWindowIds (auto_compact_window.rs:5).
+ *  rs mints Uuid::now_v7(); codex-ts uses crypto.randomUUID() when available
+ *  (browser + Node ≥ 19) and falls back to a counter-based id otherwise. */
+export interface AutoCompactWindowIds {
+  firstWindowId: string;
+  previousWindowId: string | null;
+  windowId: string;
+}
+
+let windowIdCounter = 0;
+
+function newWindowId(): string {
+  const cryptoObj: { randomUUID?: () => string } | undefined = (
+    globalThis as { crypto?: { randomUUID?: () => string } }
+  ).crypto;
+  if (typeof cryptoObj?.randomUUID === "function") {
+    return cryptoObj.randomUUID();
+  }
+  windowIdCounter += 1;
+  return `window-${Date.now().toString(36)}-${windowIdCounter}`;
+}
+
+/** mirrors AutoCompactWindowIds::new_initial (auto_compact_window.rs:12) */
+export function newInitialAutoCompactWindowIds(): AutoCompactWindowIds {
+  const windowId = newWindowId();
+  return { firstWindowId: windowId, previousWindowId: null, windowId };
+}
+
+/** mirrors AutoCompactWindowSnapshot (auto_compact_window.rs:22) — rs dropped the
+ *  `ordinal` field when window identity moved to windowNumber + ids. */
 export interface AutoCompactWindowSnapshot {
-  ordinal: number;
   prefillInputTokens: number | null;
 }
 
 export class AutoCompactWindow {
-  private ordinal = 1;
+  /** mirrors window_number (auto_compact_window.rs:35) — starts at 0, not 1, and
+   *  advances once per compaction. */
+  private windowNumber = 0;
+  private ids: AutoCompactWindowIds = newInitialAutoCompactWindowIds();
+  private newContextWindowRequested = false;
   /**
    * Absolute input-token baseline for the current window.
    * Set from the first server-observed usage after a new window opens;
@@ -20,16 +53,90 @@ export class AutoCompactWindow {
    */
   private prefillInputTokens: number | null = null;
   private prefillSource: "server" | "estimated" | null = null;
+  private tokenBudgetReminderDelivered = false;
+  private autoCompactFallbackDelivered = false;
 
   clearPrefill(): void {
     this.prefillInputTokens = null;
     this.prefillSource = null;
   }
 
-  /** Called after each compaction to start a fresh measurement window */
-  startNext(): void {
-    this.ordinal += 1;
+  /** mirrors window_number() (auto_compact_window.rs:64) */
+  currentWindowNumber(): number {
+    return this.windowNumber;
+  }
+
+  /** mirrors ids() (auto_compact_window.rs:68) */
+  currentIds(): AutoCompactWindowIds {
+    return { ...this.ids };
+  }
+
+  /** mirrors restore() (auto_compact_window.rs:72) — used when a resumed thread
+   *  replays its persisted compaction checkpoints. */
+  restore(windowNumber: number, ids: AutoCompactWindowIds): void {
+    this.windowNumber = windowNumber;
+    this.ids = { ...ids };
+  }
+
+  /**
+   * Open the next compaction window: bump the number, rotate the ids, and reset
+   * the per-window one-shot flags. mirrors advance() (auto_compact_window.rs:77).
+   *
+   * Note rs's `advance()` deliberately does NOT clear the prefill baseline —
+   * `Session::start_new_context_window` / `replace_history` do that separately
+   * (state/session.rs:122,200). Callers that rewrite history must therefore call
+   * `startNewContextWindow()` (or `clearPrefill()`) as well; see
+   * runCompactAndRecompute in session/turn.ts.
+   */
+  advance(): { windowNumber: number; ids: AutoCompactWindowIds } {
+    this.windowNumber += 1;
+    this.ids = {
+      firstWindowId: this.ids.firstWindowId,
+      previousWindowId: this.ids.windowId,
+      windowId: newWindowId(),
+    };
+    this.newContextWindowRequested = false;
+    this.tokenBudgetReminderDelivered = false;
+    this.autoCompactFallbackDelivered = false;
+    return { windowNumber: this.windowNumber, ids: this.currentIds() };
+  }
+
+  /** mirrors Session::start_new_context_window (state/session.rs:199): advance
+   *  the window AND drop the stale prefill baseline in one step. */
+  startNewContextWindow(): { windowNumber: number; ids: AutoCompactWindowIds } {
+    const advanced = this.advance();
     this.clearPrefill();
+    return advanced;
+  }
+
+  /** mirrors claim_token_budget_reminder (auto_compact_window.rs:88) — true only
+   *  the first time it is called within a window. */
+  claimTokenBudgetReminder(): boolean {
+    const claimed = !this.tokenBudgetReminderDelivered;
+    this.tokenBudgetReminderDelivered = true;
+    return claimed;
+  }
+
+  /** mirrors claim_auto_compact_fallback (auto_compact_window.rs:92) */
+  claimAutoCompactFallback(): boolean {
+    const claimed = !this.autoCompactFallbackDelivered;
+    this.autoCompactFallbackDelivered = true;
+    return claimed;
+  }
+
+  /** mirrors request_new_context_window (auto_compact_window.rs:96) — codex-rs
+   *  sets this from the `new_context` tool so the next mid-turn checkpoint rolls
+   *  the window over even when the token limit was not reached. codex-ts has no
+   *  such built-in tool, so a host can drive it from a custom tool. */
+  requestNewContextWindow(): void {
+    this.newContextWindowRequested = true;
+  }
+
+  /** mirrors take_new_context_window_request (auto_compact_window.rs:100) */
+  takeNewContextWindowRequest(): boolean {
+    const requested = this.newContextWindowRequested;
+    this.newContextWindowRequested = false;
+    return requested;
   }
 
   /**
@@ -54,7 +161,7 @@ export class AutoCompactWindow {
   }
 
   snapshot(): AutoCompactWindowSnapshot {
-    return { ordinal: this.ordinal, prefillInputTokens: this.prefillInputTokens };
+    return { prefillInputTokens: this.prefillInputTokens };
   }
 
   /**

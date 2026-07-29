@@ -241,10 +241,40 @@ describe("catalog budget (mirrors render.rs)", () => {
     );
   });
 
-  it("appends truncation warning when descriptions are shortened (mirrors render.rs)", () => {
+  it("stays silent when only a little description text is dropped (mirrors render.rs threshold)", () => {
+    // mirrors SKILL_DESCRIPTION_TRUNCATION_WARNING_THRESHOLD_CHARS (render.rs:22)
+    // via average_truncated_description_chars: these 74-char descriptions lose
+    // ~54 chars each, under the 100-char average, so rs emits NO warning.
     const out = renderSkillsCatalog(many, { kind: "characters", limit: 350 });
-    // At least one description must be shortened → truncation warning appears
+    expect(out).not.toContain("shortened to fit");
+  });
+
+  it("appends truncation warning once the average dropped description exceeds the threshold", () => {
+    const verbose: SkillMetadata[] = many.map((skill) => ({
+      ...skill,
+      description: "x".repeat(400),
+    }));
+    const out = renderSkillsCatalog(verbose, { kind: "characters", limit: 350 });
     expect(out).toContain("Skill descriptions were shortened to fit the skills context budget.");
+  });
+
+  it("caps a single description at MAX_DEFAULT_CONTEXT_SKILL_DESCRIPTION_CHARS", () => {
+    // mirrors truncate_default_context_skill_description (render.rs:537): the
+    // catalog never shows more than 1024 description chars, and the source
+    // metadata is left untouched.
+    const description = "y".repeat(2_000);
+    const skill: SkillMetadata = {
+      name: "long-skill",
+      description,
+      path: ".agents/skills/long-skill/SKILL.md",
+    };
+    const out = renderSkillsCatalog([skill], {
+      kind: "characters",
+      limit: 100_000,
+    });
+    expect(out).toContain(`${"y".repeat(1_021)}...`);
+    expect(out).not.toContain("y".repeat(1_025));
+    expect(skill.description).toBe(description);
   });
 
   it("appends omission warning when skills are dropped (mirrors render.rs)", () => {

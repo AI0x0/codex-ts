@@ -2,7 +2,7 @@
 
 轻量级 TypeScript agent harness，完全照搬 [openai/codex](https://github.com/openai/codex) Rust 实现（`codex-rs`）的架构设计，可在**浏览器**和 **Node.js** 中直接运行，无任何原生依赖。
 
-本仓库 fork 自 [`openai/codex@6bcccb0e`](https://github.com/openai/codex/commit/6bcccb0ee)，新增代码全部在 `codex-ts/` 目录，不修改上游文件。
+本仓库 fork 自 [`openai/codex@4f6eaf7a`](https://github.com/openai/codex/commit/4f6eaf7af)，新增代码全部在 `codex-ts/` 目录，不修改上游文件。
 
 ---
 
@@ -75,6 +75,9 @@ const thread = new CodexThread({
   loadSkillContent?: (skill: SkillMetadata) => Promise<string>; // 按需加载 SKILL.md 全文（Layer 2）
   agentsMd?: string;           // AGENTS.md 内容，作为独立 input 消息注入（不合并到 instructions 字段）
   autoCompactTokenLimit?: number;  // 内联自动压缩的 token 阈值（推荐：context_window × 0.9）
+  contextWindow?: number;      // 模型完整 context window，启用绝对压缩触发 + 超限自愈
+  maxRetries?: number;         // 瞬时请求/流失败的重试预算（默认 5，传 0 关闭）
+  compactPrompt?: string;      // 覆盖摘要 prompt（对应 config.compact_prompt）
 });
 ```
 
@@ -84,7 +87,7 @@ const thread = new CodexThread({
 
 | `op.type` | 说明 |
 |---|---|
-| `UserInput` | 发送用户消息，触发新一轮。可选 `model` / `instructions` 字段覆盖本轮的线程级默认值 |
+| `UserInput` | 发送用户消息，触发新一轮。`items` 支持 `{type:"text"}`、`{type:"image", image_url}` 和 `{type:"audio", audio_url}`（data URI，序列化为 `input_audio`，照搬 `UserInput::Audio`）。可选 `model` / `instructions` 字段覆盖本轮的线程级默认值 |
 | `UserInputAnswer` | 回答 `request_user_input`，`id` = `RequestUserInputEvent.turn_id` |
 | `Interrupt` | 中断当前正在执行的轮次（通过 `AbortController` 取消挂起的 `fetch`） |
 
@@ -106,15 +109,22 @@ interface Event {
 | `msg.type` | 说明 |
 |---|---|
 | `TurnStarted` | 新一轮开始 |
-| `TurnComplete` | 本轮结束，含最终回复 |
+| `TurnComplete` | 本轮结束——成功与失败都会发。含 `last_agent_message`、`started_at` / `completed_at` / `duration_ms`，失败时带 `error`（照搬 codex-rs `tasks/mod.rs`） |
+| `TurnAborted` | 被中断轮次的终止事件（`reason: "interrupted"`），此时不再发 `TurnComplete`——与 codex-rs 一致 |
 | `AgentMessage` | 模型完整消息 |
 | `AgentMessageContentDelta` | 流式文字片段 |
-| `RequestUserInput` | 模型提问，需提交 `UserInputAnswer` 恢复 |
+| `ReasoningContentDelta` | 流式 reasoning 片段，带 `item_id` + `summary_index` 以区分多段 reasoning |
+| `RequestUserInput` | 模型提问，需提交 `UserInputAnswer` 恢复。带 `autoResolutionMs` 时表示该提问非阻塞，超时后可自行按最佳判断继续 |
 | `ThreadGoalUpdated` | goal 状态变更 |
 | `PlanUpdate` | 任务清单更新，含步骤列表和各步骤状态 |
 | `ContextCompacted` | 内联压缩已执行，历史已替换为摘要 |
-| `Warning` | 建议信息（如压缩后的线程卫生提醒） |
-| `Error` | 执行出错 |
+| `TokenCount` | 每次采样后的 token 用量（含 `cache_write_input_tokens`） |
+| `Warning` | 建议信息（如压缩后的线程卫生提醒、skills 预算提示） |
+| `Error` | 执行出错，`codex_error_info` 给出错误分类（`context_window_exceeded`、`usage_limit_exceeded`、`cyber_policy`、`bad_request`…），无需再匹配错误文案 |
+
+失败的轮次会先发 `Error`、随后再发一条带 `error` 的 `TurnComplete`，所以等
+`TurnComplete` 的循环不会卡死；被**中断**的轮次则发 `Error` + `TurnAborted`
+（照搬 codex-rs：中断轮次不发 `TurnComplete`）。
 
 ---
 
@@ -645,18 +655,35 @@ codex-ts/
 
 `codex-ts/` 的所有实现均对照 codex-rs 在以下提交时的源码逐一照搬：
 
-**[`6bcccb0e`](https://github.com/openai/codex/commit/6bcccb0ee) — cli: add package path from install context (#26189)**
+**[`4f6eaf7a`](https://github.com/openai/codex/commit/4f6eaf7af) — Wait for MCP readiness in the curated sync test (#35794)**
 
 以后同步上游时，以这个哈希为起点与新版本做 diff，确认哪些 Rust 侧变更需要同步到 codex-ts 的对应 `.ts` 文件：
 
 ```bash
 # 查看上游在参照提交之后的变更
-git diff 6bcccb0e HEAD -- codex-rs/protocol/src/protocol.rs
-git diff 6bcccb0e HEAD -- codex-rs/ext/goal/src/spec.rs
+git diff 4f6eaf7a HEAD -- codex-rs/protocol/src/protocol.rs
+git diff 4f6eaf7a HEAD -- codex-rs/ext/goal/src/spec.rs
 # 依此类推对照上方映射表逐文件检查
 ```
 
 同步完成后将上方哈希替换为新的参照提交。
+
+`6bcccb0e` → 本参照提交之间上游挪动过位置的文件（diff 为空时先查这里）：
+
+| 原位置 | 现位置 |
+|---|---|
+| `core/src/session/turn.rs` — `auto_compact_token_status` | `core/src/session/context_window.rs` — `context_window_token_status` |
+| `core-skills/src/manager.rs` | `core-skills/src/service.rs` |
+| `core-skills/src/render.rs` — `### How to use skills` 段落 | `core/src/context/available_skills_instructions.rs` |
+| `state/auto_compact_window.rs` — `start_next` / `ordinal` | `advance` / `window_number` + `AutoCompactWindowIds` |
+
+**有意未照搬**的上游能力（纯 native、浏览器无对应实现）：`token_budget`
+提醒与 fallback prompt（feature 开关 + 配置层）、远端压缩
+（`compact_remote*.rs`）、换模型/comp-hash 触发的 pre-turn 压缩
+（`maybe_run_previous_model_inline_compact` 需要每个模型的 context window 元数据）、
+`new_context` 工具（其底层的窗口滚动能力已通过
+`AutoCompactWindow.requestNewContextWindow()` 暴露）、以及 `ThreadStore` 新增的
+分页 / fork / model-context 接口。
 
 ### 源码注释约定
 
@@ -692,6 +719,14 @@ git rebase upstream/main
 | `plan_spec.rs` / `plan_tool.rs` — schema 变更 | `core/src/tools/handlers/plan_spec.ts` + `protocol/src/plan_tool.ts` |
 | `thread-store/src/store.rs` — 接口变更 | `thread-store/src/store.ts` |
 | `state/src/runtime/goals.rs` — accounting 逻辑变更 | `state/src/runtime/goals.ts` |
+| `compact.rs` — 压缩逻辑变更 | `core/src/compact.ts` |
+| `state/auto_compact_window.rs` — 压缩窗口变更 | `core/src/state/auto_compact_window.ts` |
+| `session/context_window.rs` — 压缩触发条件变更 | `core/src/session/turn.ts` 的 `autoCompactTokenStatus` |
+| `prompts/templates/compact/prompt.md` — 摘要 prompt | `core/src/compact.ts` 的 `SUMMARIZATION_PROMPT` |
+| `codex-api/src/sse/responses.rs` — SSE 事件 / 错误分类 | `core/src/session/turn.ts` + `core/src/session/retry.ts` |
+| `protocol/src/error.rs` — `CodexErrorInfo` / 可重试判定 | `protocol/src/protocol.ts` 的 `CodexErrorInfo` + `core/src/session/retry.ts` 的 `codexErrorInfoFor` |
+| `core-skills/src/render.rs` — catalog 文案 / 预算 | `core/src/skills.ts` |
+| `protocol/src/user_input.rs` + `models.rs` — 新增输入模态 | `protocol/src/user_input.ts` + `thread-store/src/types.ts` 的 `UserContentPart` |
 | 新增工具 | `core/src/tools/router.ts` |
 
 ---

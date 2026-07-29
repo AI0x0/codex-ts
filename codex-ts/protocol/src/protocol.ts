@@ -23,11 +23,31 @@ export type ThreadGoalStatus =
   | "Complete";
 
 export interface ThreadGoal {
+  /** mirrors ThreadGoal.thread_id (protocol.rs:4071) — the owning thread. */
+  thread_id: string;
   objective: string;
   status: ThreadGoalStatus;
   token_budget?: number | undefined;
   tokens_used: number;
   time_used_seconds: number;
+  /** Unix epoch milliseconds — mirrors created_at/updated_at (protocol.rs:4079). */
+  created_at: number;
+  updated_at: number;
+}
+
+/** mirrors MAX_THREAD_GOAL_OBJECTIVE_CHARS (protocol.rs:4053) */
+export const MAX_THREAD_GOAL_OBJECTIVE_CHARS = 4_000;
+
+/** mirrors validate_thread_goal_objective (protocol.rs:4055) — returns the
+ *  error message, or null when the objective is acceptable. */
+export function validateThreadGoalObjective(value: string): string | null {
+  if (value.length === 0) {
+    return "goal objective must not be empty";
+  }
+  if (Array.from(value).length > MAX_THREAD_GOAL_OBJECTIVE_CHARS) {
+    return `goal objective must be at most ${MAX_THREAD_GOAL_OBJECTIVE_CHARS} characters`;
+  }
+  return null;
 }
 
 // ─── Event payloads ────────────────────────────────────────────────────────────
@@ -36,9 +56,45 @@ export interface TurnStartedEvent {
   turn_id: string;
 }
 
+/**
+ * mirrors TurnCompleteEvent (protocol.rs:1986). codex-rs emits this at the END
+ * of EVERY turn — successful or not — carrying the terminal error when the turn
+ * failed (tasks/mod.rs:803). codex-ts mirrors that: a failing turn now emits
+ * BOTH `Error` (unchanged, for hosts that key off it) and a final
+ * `TurnComplete` with `error` set, so a host looping until TurnComplete no
+ * longer hangs on failure.
+ */
 export interface TurnCompleteEvent {
   turn_id: string;
   last_agent_message?: string | undefined;
+  /** Terminal error details when the turn completed unsuccessfully. */
+  error?: ErrorEvent | undefined;
+  /** Unix timestamp (seconds) when the turn started / completed. */
+  started_at?: number | undefined;
+  completed_at?: number | undefined;
+  /** Turn wall-clock duration in milliseconds, when known. */
+  duration_ms?: number | undefined;
+}
+
+/** mirrors TurnAbortReason (protocol.rs:4209). codex-ts only ever produces
+ *  `interrupted` (Op.Interrupt); the rest exist for shape parity. */
+export type TurnAbortReason =
+  | "interrupted"
+  | "replaced"
+  | "review_ended"
+  | "budget_limited";
+
+/**
+ * mirrors TurnAbortedEvent (protocol.rs:4190). codex-rs ends an aborted turn with
+ * THIS event instead of TurnComplete (tasks/mod.rs:785-794), so an interrupted
+ * turn has its own terminal event rather than a success-shaped one.
+ */
+export interface TurnAbortedEvent {
+  turn_id?: string | undefined;
+  reason: TurnAbortReason;
+  started_at?: number | undefined;
+  completed_at?: number | undefined;
+  duration_ms?: number | undefined;
 }
 
 /** Full assistant text for a completed message */
@@ -53,21 +109,72 @@ export interface AgentMessageContentDeltaEvent {
   delta: string;
 }
 
-/** Streaming reasoning (thinking) chunk — mirrors codex-rs ReasoningContentDeltaEvent.
- *  Emitted while the model streams its reasoning/thinking, before any final
- *  output_text. Lets hosts show a "thinking" state only while truly reasoning. */
+/** Streaming reasoning (thinking) chunk — mirrors codex-rs
+ *  ReasoningContentDeltaEvent (protocol.rs:1873). Emitted while the model streams
+ *  its reasoning/thinking, before any final output_text. Lets hosts show a
+ *  "thinking" state only while truly reasoning. */
 export interface ReasoningContentDeltaEvent {
   turn_id: string;
+  /** Reasoning item this delta belongs to — mirrors item_id (protocol.rs:1876). */
+  item_id: string;
   delta: string;
+  /**
+   * Which reasoning block the delta belongs to — mirrors summary_index
+   * (protocol.rs:1880). Sourced from the SSE `summary_index` for
+   * `response.reasoning_summary_text.delta` and from `content_index` for
+   * `response.reasoning_text.delta` (codex-api/src/sse/responses.rs), so hosts
+   * can keep separate reasoning blocks apart. Defaults to 0, like rs's
+   * `#[serde(default)]`.
+   */
+  summary_index: number;
 }
 
 export interface ThreadGoalUpdatedEvent {
+  /** mirrors ThreadGoalUpdatedEvent.thread_id (protocol.rs:4087) */
+  thread_id: string;
   turn_id?: string | undefined;
   goal: ThreadGoal;
 }
 
+/**
+ * mirrors codex-rs/protocol/src/protocol.rs CodexErrorInfo (protocol.rs:1758) —
+ * the client-facing error classification. codex-ts produces the subset it can
+ * actually observe over HTTP/SSE (see codexErrorInfoFor in session/retry.ts);
+ * the remaining variants are kept for shape parity with rs.
+ */
+export type CodexErrorInfo =
+  | { type: "context_window_exceeded" }
+  | { type: "session_budget_exceeded" }
+  | { type: "usage_limit_exceeded" }
+  | { type: "server_overloaded" }
+  | { type: "cyber_policy" }
+  | { type: "http_connection_failed"; http_status_code?: number | undefined }
+  | {
+      type: "response_stream_connection_failed";
+      http_status_code?: number | undefined;
+    }
+  | { type: "internal_server_error" }
+  | { type: "unauthorized" }
+  | { type: "bad_request" }
+  | { type: "sandbox_error" }
+  | {
+      type: "response_stream_disconnected";
+      http_status_code?: number | undefined;
+    }
+  | {
+      type: "response_too_many_failed_attempts";
+      http_status_code?: number | undefined;
+    }
+  | { type: "thread_rollback_failed" }
+  | { type: "other" };
+
 export interface ErrorEvent {
   message: string;
+  /**
+   * mirrors ErrorEvent.codex_error_info (protocol.rs:1925) — lets hosts branch
+   * on the error class instead of matching message text.
+   */
+  codex_error_info?: CodexErrorInfo | undefined;
   /**
    * Browser-specific extension — no equivalent in codex-rs/protocol ErrorEvent.
    * Lets hosts correlate an error with the turn that produced it (e.g. to
@@ -86,16 +193,20 @@ export interface WarningEvent {
   message: string;
 }
 
-/** mirrors TokenUsage (protocol.rs:1919) */
+/** mirrors TokenUsage (protocol.rs:2056) */
 export interface TokenUsage {
   input_tokens: number;
   cached_input_tokens: number;
+  /** Prompt-cache WRITE tokens — mirrors cache_write_input_tokens
+   *  (protocol.rs:2063), read from `usage.input_tokens_details.cache_write_tokens`
+   *  (codex-api/src/sse/responses.rs:137). 0 when the provider omits it. */
+  cache_write_input_tokens: number;
   output_tokens: number;
   reasoning_output_tokens: number;
   total_tokens: number;
 }
 
-/** mirrors TokenUsageInfo (protocol.rs:1933) */
+/** mirrors TokenUsageInfo (protocol.rs:2073) */
 export interface TokenUsageInfo {
   total_token_usage: TokenUsage;
   last_token_usage: TokenUsage;
@@ -113,6 +224,8 @@ export interface TokenCountEvent {
 export type EventMsg =
   | { type: "TurnStarted"; event: TurnStartedEvent }
   | { type: "TurnComplete"; event: TurnCompleteEvent }
+  /** mirrors EventMsg::TurnAborted — terminal event for an interrupted turn */
+  | { type: "TurnAborted"; event: TurnAbortedEvent }
   | { type: "AgentMessage"; event: AgentMessageEvent }
   | { type: "AgentMessageContentDelta"; event: AgentMessageContentDeltaEvent }
   | { type: "ReasoningContentDelta"; event: ReasoningContentDeltaEvent }

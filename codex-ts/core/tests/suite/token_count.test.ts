@@ -34,7 +34,10 @@ describe("TokenCount event", () => {
               status: "completed",
               usage: {
                 input_tokens: 900,
-                input_tokens_details: { cached_tokens: 120 },
+                input_tokens_details: {
+                  cached_tokens: 120,
+                  cache_write_tokens: 60,
+                },
                 output_tokens: 100,
                 output_tokens_details: { reasoning_tokens: 40 },
                 total_tokens: 1000,
@@ -63,6 +66,9 @@ describe("TokenCount event", () => {
     expect(tokenCount.info?.last_token_usage).toEqual({
       input_tokens: 900,
       cached_input_tokens: 120,
+      // mirrors TokenUsage::cache_write_input_tokens ←
+      // usage.input_tokens_details.cache_write_tokens (responses.rs:137)
+      cache_write_input_tokens: 60,
       output_tokens: 100,
       reasoning_output_tokens: 40,
       total_tokens: 1000,
@@ -104,6 +110,7 @@ describe("TokenCount event", () => {
     expect(tokenCount.info?.last_token_usage).toEqual({
       input_tokens: 50,
       cached_input_tokens: 0,
+      cache_write_input_tokens: 0,
       output_tokens: 0,
       reasoning_output_tokens: 0,
       total_tokens: 60,

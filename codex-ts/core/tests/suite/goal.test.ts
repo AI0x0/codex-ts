@@ -37,10 +37,33 @@ describe("GoalToolExecutor", () => {
     expect(r.goal.objective).toBe("build it");
   });
 
-  it("create rejects second goal", async () => {
+  it("create rejects a second goal while the first is unfinished", async () => {
     await ex.create("first");
     const r = JSON.parse((await ex.create("second")).output) as { error: string };
-    expect(r.error).toMatch(/already exists/);
+    expect(r.error).toMatch(/unfinished goal/);
+  });
+
+  // mirrors create_thread_goal's `DO UPDATE … WHERE status = 'complete'`
+  // (goals.rs:236): a finished goal is replaced and its counters reset.
+  it("create replaces a completed goal", async () => {
+    await ex.create("first", 500);
+    await ex.recordTokens(300);
+    await ex.update("complete");
+
+    const r = JSON.parse((await ex.create("second")).output) as {
+      goal: { objective: string; status: string; tokens_used: number };
+    };
+    expect(r.goal.objective).toBe("second");
+    expect(r.goal.status).toBe("Active");
+    expect(r.goal.tokens_used).toBe(0);
+  });
+
+  // mirrors validate_thread_goal_objective (protocol.rs:4055)
+  it("create rejects an over-long objective", async () => {
+    const r = JSON.parse((await ex.create("x".repeat(4_001))).output) as {
+      error: string;
+    };
+    expect(r.error).toMatch(/at most 4000 characters/);
   });
 
   it("create stores token_budget", async () => {
@@ -137,3 +160,4 @@ describe("create_goal tool call", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
+

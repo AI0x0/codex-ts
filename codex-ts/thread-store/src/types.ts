@@ -25,7 +25,9 @@ export type ImageDetail = "auto" | "low" | "high" | "original";
 /** mirrors codex-rs/protocol/src/models.rs ContentItem (input variants) */
 export type UserContentPart =
   | { type: "input_text"; text: string }
-  | { type: "input_image"; image_url: string; detail?: ImageDetail };
+  | { type: "input_image"; image_url: string; detail?: ImageDetail }
+  /** mirrors ContentItem::InputAudio (models.rs:723) — a base64 data URI. */
+  | { type: "input_audio"; audio_url: string };
 
 export type ConversationItem =
   | {

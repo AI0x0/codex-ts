@@ -141,10 +141,20 @@ export class ToolRouter {
         if ("error" in normalized) {
           return JSON.stringify({ error: normalized.error });
         }
-        // Emit BEFORE suspending so the client can see the event and answer
+        // Emit BEFORE suspending so the client can see the event and answer.
+        // autoResolutionMs rides along (mirrors RequestUserInputEvent
+        // .auto_resolution_ms) so the host can decide whether the question is
+        // blocking or may be auto-resolved after that window.
         ctx.emitEvent({
           type: "RequestUserInput",
-          event: { call_id: callId, turn_id: ctx.turnId, questions: normalized.questions },
+          event: {
+            call_id: callId,
+            turn_id: ctx.turnId,
+            questions: normalized.questions,
+            ...(normalized.autoResolutionMs !== undefined
+              ? { autoResolutionMs: normalized.autoResolutionMs }
+              : {}),
+          },
         });
         const response = await handleRequestUserInput(
           { turnId: ctx.turnId, pendingInputs: ctx.pendingInputs },

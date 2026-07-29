@@ -24,6 +24,7 @@ import type {
 } from "../../../thread-store/src/types.js";
 import { parseSseStream } from "./sse.js";
 import {
+  classifyStreamFailure,
   computeRetryDelay,
   DEFAULT_MAX_RETRIES,
   isContextWindowExceededError,
@@ -112,6 +113,12 @@ export interface TurnConfig {
    */
   maxRetries?: number | undefined;
   /**
+   * Overrides the inline-compaction summarization prompt. mirrors
+   * `config.compact_prompt` (compact.rs:118-123) — omit to use the bundled
+   * SUMMARIZATION_PROMPT.
+   */
+  compactPrompt?: string | undefined;
+  /**
    * Turn-scoped context messages prepended to `input` ahead of history,
    * mirroring codex-rs's contextual user fragments: user_instructions
    * (developer + AGENTS.md) and the skills catalog ride here as discrete
@@ -123,18 +130,30 @@ export interface TurnConfig {
 // ─── Auto-compaction status + orchestration ──────────────────────────────────
 
 /**
- * mirrors auto_compact_token_status (turn.rs:719-769), BodyAfterPrefix scope:
- * the limit is reached when EITHER the growth since the window baseline hits
- * `autoCompactTokenLimit`, OR the total active context reaches the model's
+ * mirrors context_window_token_status (core/src/session/context_window.rs:23 —
+ * the module upstream extracted `auto_compact_token_status` into), BodyAfterPrefix
+ * scope: the limit is reached when EITHER the growth since the window baseline
+ * hits `autoCompactTokenLimit`, OR the total active context reaches the model's
  * full `contextWindow`. The second condition is what keeps a session with a
  * large baseline (or a force-filled one after a context-window-exceeded
  * rejection) from sailing past the model's window.
+ *
+ * rs additionally widens the scope limit by
+ * `token_budget.auto_compact_fallback_buffer_tokens` and reports
+ * `base_window_tokens_remaining`, both only used by its feature-gated
+ * token-budget reminders (session/token_budget.rs). codex-ts has no
+ * `token_budget` config, so the buffer is 0 — identical behaviour — and the
+ * remaining-tokens readout is left out; hosts can derive it from TokenCount's
+ * `model_context_window` + `total_token_usage`.
  */
 function autoCompactTokenStatus(
   config: TurnConfig,
   compactWindow: AutoCompactWindow,
   tokenState: SessionTokenState,
-): { activeContextTokens: number; tokenLimitReached: boolean } {
+): {
+  activeContextTokens: number;
+  tokenLimitReached: boolean;
+} {
   const activeContextTokens = tokenState.totalTokens ?? 0;
   const scopeTokens = compactWindow.bodyAfterPrefix(activeContextTokens);
   const scopeLimit =
@@ -151,10 +170,11 @@ function autoCompactTokenStatus(
 
 /**
  * Run one inline compaction and reseed the token bookkeeping.
- * mirrors run_auto_compact + recompute_token_usage (session/mod.rs:3059-3095):
- * after history is rewritten, the session total and the NEW window's baseline
- * both restart from a byte-based estimate of the compacted context (replaced
- * by real server usage on the next sampled response).
+ * mirrors run_auto_compact + recompute_token_usage (compact.rs:359-386 +
+ * session/mod.rs:3794-3831): after history is rewritten, the session total and
+ * the NEW window's baseline both restart from a byte-based estimate of the
+ * compacted context (replaced by real server usage on the next sampled
+ * response).
  */
 async function runCompactAndRecompute(
   history: ConversationItem[],
@@ -165,7 +185,10 @@ async function runCompactAndRecompute(
 ): Promise<void> {
   emitEvent({ type: "ContextCompacted", event: {} });
   await runInlineAutoCompactTask(history, config);
-  compactWindow.startNext();
+  // mirrors advance_auto_compact_window (compact.rs:359) followed by
+  // replace_compacted_history → replace_history's clear_prefill
+  // (state/session.rs:122): one call does both here.
+  compactWindow.startNewContextWindow();
   const estimated =
     estimateItemsTokenCount([...(config.contextItems ?? []), ...history]) +
     approxTokenCount(config.instructions ?? "");
@@ -213,16 +236,23 @@ export async function runTurn(
   // history array). codex-rs records each queued UserInput submission as its OWN
   // role:user item and never merges them; we mirror that by recording `userItems`
   // (the primary message) followed by each `extraUserMessages` entry as a separate
-  // message. text → input_text, image → input_image { image_url } (detail default).
+  // message. Content mapping mirrors ResponseInputItem::from(Vec<UserInput>)
+  // (protocol/src/models.rs:1735): text → input_text, image → input_image
+  // { image_url } (detail default), audio → input_audio { audio_url }.
   const toUserContent = (items: UserInput[]): UserContentPart[] =>
     items
-      .map((item): UserContentPart | null =>
-        item.type === "text"
-          ? { type: "input_text", text: item.text }
-          : item.type === "image"
-            ? { type: "input_image", image_url: item.image_url }
-            : null,
-      )
+      .map((item): UserContentPart | null => {
+        switch (item.type) {
+          case "text":
+            return { type: "input_text", text: item.text };
+          case "image":
+            return { type: "input_image", image_url: item.image_url };
+          case "audio":
+            return { type: "input_audio", audio_url: item.audio_url };
+          default:
+            return null;
+        }
+      })
       .filter((part): part is UserContentPart => part !== null);
   const userMsgs: HistoryItem[] = [userItems, ...(extraUserMessages ?? [])]
     .map(toUserContent)
@@ -420,10 +450,27 @@ export async function runTurn(
               // codex-api/src/sse/responses.rs 的 reasoning delta 分支。供 host 在模型
               // "真正 thinking"（而非仅已发请求未回）时显示 Thinking。Gemini 的 thinking
               // 经 codeproxy 翻译为 responses reasoning，正是从这两个 SSE 事件流出。
+              //
+              // summary_index 照搬 rs 的 ReasoningContentDelta{,Summary} 分支
+              // （responses.rs:355-379）：summary 用 `summary_index`，raw
+              // reasoning 用 `content_index`，供 host 区分多段 reasoning。
+              // rs 的 SSE 层不带 item_id（由 core 的
+              // assign_missing_streamed_response_item_id 补），故这里在事件缺失
+              // item_id 时同样回落到当前 item。
               const delta = String(raw["delta"] ?? "");
+              const blockIndex =
+                raw["type"] === "response.reasoning_summary_text.delta"
+                  ? raw["summary_index"]
+                  : raw["content_index"];
               emitEvent({
                 type: "ReasoningContentDelta",
-                event: { turn_id: turnId, delta },
+                event: {
+                  turn_id: turnId,
+                  item_id: String(raw["item_id"] ?? currentItemId),
+                  delta,
+                  summary_index:
+                    typeof blockIndex === "number" ? blockIndex : 0,
+                },
               });
               break;
             }
@@ -487,6 +534,13 @@ export async function runTurn(
                     inputDetails?.["cached_tokens"],
                     0,
                   ),
+                  // mirrors TokenUsage::cache_write_input_tokens ←
+                  // usage.input_tokens_details.cache_write_tokens
+                  // (codex-api/src/sse/responses.rs:137).
+                  cache_write_input_tokens: numberOr(
+                    inputDetails?.["cache_write_tokens"],
+                    0,
+                  ),
                   output_tokens: numberOr(usage["output_tokens"], 0),
                   reasoning_output_tokens: numberOr(
                     outputDetails?.["reasoning_tokens"],
@@ -515,20 +569,18 @@ export async function runTurn(
               }
               break;
             }
-            case "response.failed": {
-              // mirrors codex-api sse/responses.rs "response.failed": the stream's
-              // terminal error event. Surface it as a ResponsesApiError so the
-              // catch below classifies it — context-window-exceeded is terminal
-              // (and marks tokens full); anything else is treated as a transient
-              // stream failure (rs defaults response.failed to Retryable; the
-              // 503 status keeps it in the retryable set here).
-              const resp = raw["response"] as
-                | Record<string, unknown>
-                | undefined;
-              throw new ResponsesApiError(
-                503,
-                JSON.stringify(resp?.["error"] ?? raw),
-              );
+            case "response.failed":
+            case "response.incomplete": {
+              // mirrors codex-api sse/responses.rs process_responses_event's
+              // terminal arms (responses.rs:387-431): `response.failed` is
+              // classified from `response.error.code` — quota / cyber-policy /
+              // invalid-prompt / server-overloaded are TERMINAL (rs maps them to
+              // non-retryable CodexErr variants), a rate limit carries its
+              // "try again in Xs" delay, anything unrecognised stays retryable —
+              // and `response.incomplete` becomes a retryable stream error.
+              // context-window-exceeded is detected by the catch below, which
+              // also marks the session tokens full.
+              throw classifyStreamFailure(raw);
             }
           }
         }
@@ -648,7 +700,7 @@ export async function runTurn(
       await liveThread?.appendConversationItems([outputItem]);
     }
 
-    // ── Auto-compaction check (mirrors post-sampling compact, turn.rs:266-292) ─
+    // ── Auto-compaction check (mirrors post-sampling compact, turn.rs:417-455) ─
     // Only triggered mid-turn (more sampling rounds follow), matching
     // `token_limit_reached && needs_follow_up` in codex-rs. Runs AFTER the tool
     // outputs are recorded — codex-rs compacts only between COMPLETE rounds; an
@@ -659,7 +711,13 @@ export async function runTurn(
     // active context ≥ contextWindow (see autoCompactTokenStatus).
     {
       const status = autoCompactTokenStatus(config, compactWindow, tokenState);
-      if (status.tokenLimitReached) {
+      // mirrors should_roll_over (turn.rs:418-420): mid-turn compaction fires
+      // when the token limit is reached OR a new context window was explicitly
+      // requested (rs's `new_context` tool; in codex-ts a host can request one
+      // via compactWindow.requestNewContextWindow()). take… clears the flag, so
+      // it must be consulted every round even when the limit already tripped.
+      const rollOverRequested = compactWindow.takeNewContextWindowRequest();
+      if (rollOverRequested || status.tokenLimitReached) {
         await runCompactAndRecompute(
           history,
           config,

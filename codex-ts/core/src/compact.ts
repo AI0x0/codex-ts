@@ -11,6 +11,7 @@ import type { ConversationItem } from "../../thread-store/src/types.js";
 import type { TurnConfig } from "./session/turn.js";
 import { parseSseStream } from "./session/sse.js";
 import {
+  classifyStreamFailure,
   computeRetryDelay,
   DEFAULT_MAX_RETRIES,
   isContextWindowExceededError,
@@ -61,21 +62,36 @@ function truncateToTokens(text: string, maxTokens: number): string {
 // ─── History helpers ─────────────────────────────────────────────────────────
 
 /**
- * Extract plain-text content from all user messages in history.
- * mirrors collect_user_messages in compact.rs
+ * True when a user message is itself a previous compaction summary.
+ * mirrors is_summary_message (compact.rs:550).
+ */
+export function isSummaryMessage(message: string): boolean {
+  return message.startsWith(`${SUMMARY_PREFIX}\n`);
+}
+
+/**
+ * Extract plain-text content from all user messages in history, skipping
+ * previous compaction summaries.
+ * mirrors collect_user_messages (compact.rs:525): a message that starts with
+ * SUMMARY_PREFIX is dropped, so a second compaction does not re-collect the
+ * first summary as a "user message" and stack summaries on top of each other.
+ * Note the summary produced by THIS compaction is appended separately by
+ * buildCompactedHistory.
  */
 export function collectUserMessages(history: ConversationItem[]): string[] {
   const messages: string[] = [];
   for (const item of history) {
     if (!("role" in item) || item.role !== "user") continue;
     if (typeof item.content === "string") {
-      if (item.content) messages.push(item.content);
+      if (item.content && !isSummaryMessage(item.content)) {
+        messages.push(item.content);
+      }
     } else if (Array.isArray(item.content)) {
       const text = item.content
         .filter((p): p is { type: "input_text"; text: string } => p.type === "input_text")
         .map((p) => p.text)
         .join("\n");
-      if (text) messages.push(text);
+      if (text && !isSummaryMessage(text)) messages.push(text);
     }
   }
   return messages;
@@ -157,11 +173,15 @@ export async function runInlineAutoCompactTask(
   let trimRounds = 0;
   let summaryText = "";
 
+  // mirrors run_inline_auto_compact_task (compact.rs:118): the host may override
+  // the summarization prompt (`config.compact_prompt`), else the bundled one.
+  const compactPrompt = config.compactPrompt ?? SUMMARIZATION_PROMPT;
+
   for (;;) {
     // Build the compaction request: history + the summarization prompt at the end
     const compactInput: ConversationItem[] = [
       ...summarizerInput,
-      { type: "message", role: "user", content: SUMMARIZATION_PROMPT },
+      { type: "message", role: "user", content: compactPrompt },
     ];
 
     const body: Record<string, unknown> = {
@@ -195,14 +215,14 @@ export async function runInlineAutoCompactTask(
       for await (const raw of parseSseStream(res.body)) {
         if (raw["type"] === "response.output_text.delta") {
           summaryText += String(raw["delta"] ?? "");
-        } else if (raw["type"] === "response.failed") {
-          // Terminal stream error — same classification as the turn loop
-          // (context-window-exceeded → trim; otherwise retryable).
-          const resp = raw["response"] as Record<string, unknown> | undefined;
-          throw new ResponsesApiError(
-            503,
-            JSON.stringify(resp?.["error"] ?? raw),
-          );
+        } else if (
+          raw["type"] === "response.failed" ||
+          raw["type"] === "response.incomplete"
+        ) {
+          // Terminal stream event — same classification as the turn loop
+          // (context-window-exceeded → trim; quota/policy failures → terminal;
+          // otherwise retryable). mirrors process_responses_event.
+          throw classifyStreamFailure(raw);
         }
       }
       break; // summary collected → leave the retry loop

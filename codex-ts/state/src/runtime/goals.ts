@@ -63,22 +63,45 @@ export class GoalStore {
     return this.backend.getThreadGoal(threadId);
   }
 
-  /** Create or replace a thread goal */
+  /** Create or replace a thread goal (mirrors replace_thread_goal, goals.rs:158) */
   async replaceThreadGoal(
     threadId: string,
     objective: string,
     status: ThreadGoalStatus,
     token_budget?: number,
   ): Promise<ThreadGoal> {
+    const now = Date.now();
     const goal: ThreadGoal = {
+      thread_id: threadId,
       objective,
       status,
       ...(token_budget !== undefined ? { token_budget } : {}),
       tokens_used: 0,
       time_used_seconds: 0,
+      created_at: now,
+      updated_at: now,
     };
     await this.backend.saveThreadGoal(threadId, goal);
     return goal;
+  }
+
+  /**
+   * Create a goal only when the thread has no goal, or its goal is already
+   * complete. mirrors create_thread_goal (goals.rs:225): upstream changed the
+   * `ON CONFLICT(thread_id) DO NOTHING` to `DO UPDATE … WHERE status =
+   * 'complete'`, so a finished goal is replaced (usage counters reset to 0)
+   * while an UNFINISHED goal still blocks creation. Returns null when blocked.
+   */
+  async createThreadGoal(
+    threadId: string,
+    objective: string,
+    token_budget?: number,
+  ): Promise<ThreadGoal | null> {
+    const existing = await this.getThreadGoal(threadId);
+    if (existing !== null && existing.status !== "Complete") {
+      return null;
+    }
+    return this.replaceThreadGoal(threadId, objective, "Active", token_budget);
   }
 
   /** Apply a partial update to an existing goal */
@@ -86,7 +109,7 @@ export class GoalStore {
     threadId: string,
     update: GoalUpdate,
   ): Promise<GoalAccountingOutcome> {
-    const existing = await this.backend.getThreadGoal(threadId);
+    const existing = await this.getThreadGoal(threadId);
     if (existing === null) {
       return { kind: "Unchanged", goal: null };
     }
@@ -98,9 +121,24 @@ export class GoalStore {
           ? {}
           : { token_budget: update.token_budget }
         : {}),
+      updated_at: Date.now(),
     };
     await this.backend.saveThreadGoal(threadId, updated);
     return { kind: "Updated", goal: updated };
+  }
+
+  /**
+   * Delete the thread's goal and return what was removed (null when there was
+   * none). mirrors delete_thread_goal (goals.rs:472), which upstream changed
+   * from `bool` to the deleted row so callers can report/emit it.
+   */
+  async deleteThreadGoal(threadId: string): Promise<ThreadGoal | null> {
+    const existing = await this.getThreadGoal(threadId);
+    if (existing === null) {
+      return null;
+    }
+    await this.backend.deleteThreadGoal(threadId);
+    return existing;
   }
 
   /**
@@ -112,7 +150,7 @@ export class GoalStore {
     tokens: number,
     elapsedSeconds: number,
   ): Promise<GoalAccountingOutcome> {
-    const existing = await this.backend.getThreadGoal(threadId);
+    const existing = await this.getThreadGoal(threadId);
     if (existing === null || existing.status !== "Active") {
       return { kind: "Unchanged", goal: existing };
     }
@@ -133,6 +171,7 @@ export class GoalStore {
       tokens_used,
       time_used_seconds,
       status,
+      updated_at: Date.now(),
     };
     await this.backend.saveThreadGoal(threadId, updated);
     const changed = status !== existing.status || tokens_used !== existing.tokens_used;

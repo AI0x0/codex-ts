@@ -6,6 +6,9 @@ import type { ToolSpec } from "../../../../tools/src/tool_spec.js";
 import * as S from "../../../../tools/src/json_schema.js";
 
 export const REQUEST_USER_INPUT_TOOL_NAME = "request_user_input";
+/** mirrors MIN/MAX_AUTO_RESOLUTION_MS (request_user_input_spec.rs:9-10) */
+export const MIN_AUTO_RESOLUTION_MS = 60_000;
+export const MAX_AUTO_RESOLUTION_MS = 240_000;
 
 export function createRequestUserInputTool(): ToolSpec {
   const optionSchema = S.object(
@@ -36,18 +39,34 @@ export function createRequestUserInputTool(): ToolSpec {
     false,
   );
 
+  // mirrors auto_resolution_ms_schema (request_user_input_spec.rs:71)
+  const autoResolutionMsSchema = S.number(
+    `Optional auto-resolution window in milliseconds, from ${MIN_AUTO_RESOLUTION_MS} to ${MAX_AUTO_RESOLUTION_MS}. ` +
+      "Include this only when the question is useful but non-blocking and continuing with best judgment is acceptable " +
+      "if the user does not answer; omit it when explicit user input is required before continuing. " +
+      `Use ${MIN_AUTO_RESOLUTION_MS} for lightly helpful context and up to ${MAX_AUTO_RESOLUTION_MS} when the answer ` +
+      "would materially unblock better work.",
+  );
+
   return {
     type: "function",
     tool: {
       name: REQUEST_USER_INPUT_TOOL_NAME,
+      // mirrors request_user_input_tool_description (request_user_input_spec.rs:138).
+      // The rs "only available in {allowed_modes}" clause is dropped: codex-ts has
+      // no collaboration modes, so the tool is always available.
       description:
-        "Request user input for one to three short questions and wait for the response.",
+        "Request user input for one to three short questions and wait for the response. " +
+        `Set autoResolutionMs, from ${MIN_AUTO_RESOLUTION_MS} to ${MAX_AUTO_RESOLUTION_MS} milliseconds, only when ` +
+        "the question is useful but non-blocking and continuing with best judgment is acceptable if the user does " +
+        "not answer; omit it when explicit user input is required.",
       parameters: S.object(
         {
           questions: S.array(
             questionSchema,
             "Questions to show the user. Prefer 1 and do not exceed 3.",
           ),
+          autoResolutionMs: autoResolutionMsSchema,
         },
         ["questions"],
         false,
@@ -57,7 +76,11 @@ export function createRequestUserInputTool(): ToolSpec {
   };
 }
 
-/** Normalise args from the model: ensure options exist and set isOther = true */
+/**
+ * Normalise args from the model: ensure options exist, set isOther = true, and
+ * clamp autoResolutionMs into the supported range.
+ * mirrors normalize_request_user_input_args (request_user_input_spec.rs:104).
+ */
 export function normalizeRequestUserInputArgs(args: {
   questions?: {
     id: string;
@@ -67,7 +90,13 @@ export function normalizeRequestUserInputArgs(args: {
     isOther?: boolean;
     isSecret?: boolean;
   }[];
-}): { questions: import("../../../../protocol/src/request_user_input.js").RequestUserInputQuestion[] } | { error: string } {
+  autoResolutionMs?: unknown;
+}):
+  | {
+      questions: import("../../../../protocol/src/request_user_input.js").RequestUserInputQuestion[];
+      autoResolutionMs?: number | undefined;
+    }
+  | { error: string } {
   // The model can omit `questions` (or send a non-array) under strict:false;
   // guard before iterating so we return a tool error instead of throwing
   // "undefined is not an object (evaluating 'args.questions')".
@@ -83,6 +112,18 @@ export function normalizeRequestUserInputArgs(args: {
       };
     }
   }
+  // mirrors the auto_resolution_ms clamp (request_user_input_spec.rs:123): an
+  // out-of-range window is pulled into [MIN, MAX] rather than rejected. A
+  // non-numeric value (strict:false lets the model send anything) is dropped.
+  const rawAutoResolutionMs = args.autoResolutionMs;
+  const autoResolutionMs =
+    typeof rawAutoResolutionMs === "number" && Number.isFinite(rawAutoResolutionMs)
+      ? Math.min(
+          MAX_AUTO_RESOLUTION_MS,
+          Math.max(MIN_AUTO_RESOLUTION_MS, Math.trunc(rawAutoResolutionMs)),
+        )
+      : undefined;
+
   return {
     questions: args.questions.map((q) => ({
       id: q.id,
@@ -92,5 +133,6 @@ export function normalizeRequestUserInputArgs(args: {
       isOther: true,
       isSecret: q.isSecret ?? false,
     })),
+    ...(autoResolutionMs !== undefined ? { autoResolutionMs } : {}),
   };
 }

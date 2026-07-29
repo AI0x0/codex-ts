@@ -2,7 +2,7 @@
 
 A lightweight TypeScript agent harness that mirrors the architecture of [openai/codex](https://github.com/openai/codex) (`codex-rs`) — runs in the **browser** and **Node.js** with zero native dependencies.
 
-Forked from [`openai/codex@6bcccb0e`](https://github.com/openai/codex/commit/6bcccb0ee). All new code lives in `codex-ts/`; upstream files are untouched.
+Forked from [`openai/codex@4f6eaf7a`](https://github.com/openai/codex/commit/4f6eaf7af). All new code lives in `codex-ts/`; upstream files are untouched.
 
 [中文文档](./README.zh.md)
 
@@ -78,6 +78,9 @@ const thread = new CodexThread({
   loadSkillContent?: (skill: SkillMetadata) => Promise<string>; // full-body loader for $mention injection (Layer 2)
   agentsMd?: string;           // AGENTS.md content injected as a discrete input message (not merged into instructions)
   autoCompactTokenLimit?: number;  // token threshold for inline auto-compaction (e.g. context_window × 0.9)
+  contextWindow?: number;      // model's full context window; arms the absolute compaction trigger + self-heal
+  maxRetries?: number;         // transient request/stream retry budget (default 5; 0 disables)
+  compactPrompt?: string;      // override the summarization prompt (mirrors config.compact_prompt)
 });
 ```
 
@@ -87,7 +90,7 @@ Submit an operation; returns `submission_id`. Mirrors `pub async fn submit(&self
 
 | `op.type` | Description |
 |---|---|
-| `UserInput` | Send a user message, starts a new turn. Optional `model` and `instructions` fields override the thread-level defaults for this turn only |
+| `UserInput` | Send a user message, starts a new turn. `items` accept `{type:"text"}`, `{type:"image", image_url}` and `{type:"audio", audio_url}` (a data URI → `input_audio`, mirroring `UserInput::Audio`). Optional `model` and `instructions` fields override the thread-level defaults for this turn only |
 | `UserInputAnswer` | Answer a `request_user_input` call; `id` = `RequestUserInputEvent.turn_id` |
 | `Interrupt` | Abort the in-flight turn (cancels the pending `fetch` via `AbortController`) |
 
@@ -113,15 +116,22 @@ Async factory — use instead of `new` when resuming an existing thread. Loads c
 | `msg.type` | Description |
 |---|---|
 | `TurnStarted` | A new turn has begun |
-| `TurnComplete` | Turn finished; contains the final reply |
+| `TurnComplete` | Turn finished — emitted on success **and** failure. Carries `last_agent_message`, `started_at` / `completed_at` / `duration_ms`, and `error` when the turn failed (mirrors codex-rs `tasks/mod.rs`) |
+| `TurnAborted` | Terminal event for an interrupted turn (`reason: "interrupted"`); replaces `TurnComplete` in that case, as in codex-rs |
 | `AgentMessage` | Complete assistant message |
 | `AgentMessageContentDelta` | Streaming text chunk |
-| `RequestUserInput` | Model is asking the user; submit `UserInputAnswer` to resume |
+| `ReasoningContentDelta` | Streaming reasoning chunk, with `item_id` + `summary_index` so separate reasoning blocks stay distinct |
+| `RequestUserInput` | Model is asking the user; submit `UserInputAnswer` to resume. `autoResolutionMs` (when present) means the question is non-blocking and may be auto-resolved after that window |
 | `ThreadGoalUpdated` | Goal state changed |
 | `PlanUpdate` | Task checklist updated with step list and statuses |
 | `ContextCompacted` | Inline compaction ran; history has been replaced with a summary |
-| `Warning` | Advisory (e.g. post-compaction thread hygiene reminder) |
-| `Error` | Execution error |
+| `TokenCount` | Recorded token usage after each sampled response (`cache_write_input_tokens` included) |
+| `Warning` | Advisory (e.g. post-compaction thread hygiene reminder, skills-budget notice) |
+| `Error` | Execution error; `codex_error_info` classifies it (`context_window_exceeded`, `usage_limit_exceeded`, `cyber_policy`, `bad_request`, …) so hosts don't have to match message text |
+
+A failing turn emits `Error` **and then** `TurnComplete` (with `error` set), so a
+loop that awaits `TurnComplete` never hangs. An **interrupted** turn ends with
+`TurnAborted` instead of `TurnComplete` — same as codex-rs (`tasks/mod.rs`).
 
 ---
 
@@ -375,14 +385,14 @@ Mirrors `codex-rs/core/src/compact.rs`. When the context grows past `autoCompact
 
 **Algorithm (BodyAfterPrefix mode, matching codex-rs default):**
 
-1. Each sampling round records `input_tokens` from `response.done`
+1. Each sampling round records `input_tokens` from `response.completed`
 2. The first round in a window sets the baseline; subsequent rounds measure growth: `scope_tokens = current − baseline`
-3. When `scope_tokens ≥ autoCompactTokenLimit` **and** tool calls remain (mid-turn), compaction fires:
-   - A separate request sends the full history + `SUMMARIZATION_PROMPT` to the model
+3. When `scope_tokens ≥ autoCompactTokenLimit` (or a host called `requestNewContextWindow()`) **and** tool calls remain (mid-turn), compaction fires:
+   - A separate request sends the full history + `SUMMARIZATION_PROMPT` (or `compactPrompt`) to the model
    - The summary is prefixed with `SUMMARY_PREFIX` and stored as the last user message
-   - Recent user messages (up to 20 000 tokens) are prepended before the summary
+   - Recent user messages (up to 20 000 tokens) are prepended before the summary — a *previous* summary is skipped, so summaries never stack (`is_summary_message`)
    - History is replaced in-place; `ContextCompacted` + `Warning` events are emitted
-   - The token baseline resets for the next window (`startNext()`)
+   - The next window opens and the token baseline resets (`startNewContextWindow()` = rs `advance()` + `clear_prefill()`)
 
 ```ts
 // Recommended value: 90% of the model's context window
@@ -661,18 +671,36 @@ Only `codex-ts/` is added; the single upstream file change is one line appended 
 
 All implementations in `codex-ts/` were written against codex-rs at:
 
-**[`6bcccb0e`](https://github.com/openai/codex/commit/6bcccb0ee) — cli: add package path from install context (#26189)**
+**[`4f6eaf7a`](https://github.com/openai/codex/commit/4f6eaf7af) — Wait for MCP readiness in the curated sync test (#35794)**
 
 When syncing, diff from this hash to find what changed in the Rust source and update the corresponding `.ts` file:
 
 ```bash
 # Check what changed in mirrored files
-git diff 6bcccb0e HEAD -- codex-rs/protocol/src/protocol.rs
-git diff 6bcccb0e HEAD -- codex-rs/ext/goal/src/spec.rs
+git diff 4f6eaf7a HEAD -- codex-rs/protocol/src/protocol.rs
+git diff 4f6eaf7a HEAD -- codex-rs/ext/goal/src/spec.rs
 # repeat for each file in the mapping table below
 ```
 
 Update the hash above to the new reference commit after each sync.
+
+Upstream files that moved between `6bcccb0e` and this commit (useful when a diff
+comes back empty):
+
+| Was | Now |
+|---|---|
+| `core/src/session/turn.rs` — `auto_compact_token_status` | `core/src/session/context_window.rs` — `context_window_token_status` |
+| `core-skills/src/manager.rs` | `core-skills/src/service.rs` |
+| `core-skills/src/render.rs` — `### How to use skills` section | `core/src/context/available_skills_instructions.rs` |
+| `state/auto_compact_window.rs` — `start_next` / `ordinal` | `advance` / `window_number` + `AutoCompactWindowIds` |
+
+Deliberately **not** ported (native-only upstream features with no browser
+counterpart): `token_budget` reminders/fallback prompts (feature-gated config),
+remote compaction (`compact_remote*.rs`), previous-model / comp-hash pre-turn
+compaction (`maybe_run_previous_model_inline_compact` needs per-model context
+windows), the `new_context` tool (the underlying window roll-over IS available
+via `AutoCompactWindow.requestNewContextWindow()`), and the paginated
+fork/search/model-context additions to `ThreadStore`.
 
 ### Source comment conventions
 
@@ -698,7 +726,12 @@ so you know at a glance whether a diff from upstream requires action:
 | `state/src/runtime/goals.rs` — accounting change | `state/src/runtime/goals.ts` |
 | `compact.rs` — compaction logic change | `core/src/compact.ts` |
 | `state/auto_compact_window.rs` — window tracking change | `core/src/state/auto_compact_window.ts` |
+| `session/context_window.rs` — compaction trigger change | `autoCompactTokenStatus` in `core/src/session/turn.ts` |
 | `prompts/templates/compact/prompt.md` — summarisation prompt | `SUMMARIZATION_PROMPT` in `core/src/compact.ts` |
+| `codex-api/src/sse/responses.rs` — SSE event / error classification | `core/src/session/turn.ts` + `core/src/session/retry.ts` |
+| `protocol/src/error.rs` — `CodexErrorInfo` / retryability | `CodexErrorInfo` in `protocol/src/protocol.ts` + `codexErrorInfoFor` in `core/src/session/retry.ts` |
+| `core-skills/src/render.rs` — catalog text / budget | `core/src/skills.ts` |
+| `protocol/src/user_input.rs` + `models.rs` — new input modality | `protocol/src/user_input.ts` + `UserContentPart` in `thread-store/src/types.ts` |
 | New tool added | `core/src/tools/router.ts` |
 
 ### Sync workflow

@@ -31,6 +31,11 @@ export function integer(description?: string): JsonSchema {
   return { type: "integer", ...(description ? { description } : {}) };
 }
 
+/** mirrors JsonSchema::number (json_schema.rs JsonSchemaPrimitiveType::Number) */
+export function number(description?: string): JsonSchema {
+  return { type: "number", ...(description ? { description } : {}) };
+}
+
 export function stringEnum(values: string[], description?: string): JsonSchema {
   return {
     type: "string",

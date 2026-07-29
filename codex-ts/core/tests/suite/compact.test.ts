@@ -12,6 +12,7 @@ import { AutoCompactWindow } from "../../src/state/auto_compact_window.js";
 import {
   collectUserMessages,
   buildCompactedHistory,
+  isSummaryMessage,
   runInlineAutoCompactTask,
   SUMMARIZATION_PROMPT,
   SUMMARY_PREFIX,
@@ -57,17 +58,60 @@ describe("AutoCompactWindow — BodyAfterPrefix tracking", () => {
     expect(w.bodyAfterPrefix(1000)).toBe(200);
   });
 
-  it("startNext resets baseline and bumps ordinal", () => {
+  // mirrors auto_compact_window.rs tracks_prefill_and_window_boundaries: the
+  // window number starts at 0 and advance() rotates the ids; clearing the
+  // baseline is start_new_context_window's job (state/session.rs:199).
+  it("startNewContextWindow resets baseline and bumps the window number", () => {
     const w = new AutoCompactWindow();
     w.ensureServerObservedPrefill(800);
-    expect(w.snapshot().ordinal).toBe(1);
+    expect(w.currentWindowNumber()).toBe(0);
+    const initialIds = w.currentIds();
+    expect(initialIds.previousWindowId).toBeNull();
+    expect(initialIds.firstWindowId).toBe(initialIds.windowId);
 
-    w.startNext();
-    const snap = w.snapshot();
-    expect(snap.ordinal).toBe(2);
-    expect(snap.prefillInputTokens).toBeNull();
+    const advanced = w.startNewContextWindow();
+    expect(advanced.windowNumber).toBe(1);
+    expect(w.currentWindowNumber()).toBe(1);
+    expect(advanced.ids.firstWindowId).toBe(initialIds.firstWindowId);
+    expect(advanced.ids.previousWindowId).toBe(initialIds.windowId);
+    expect(advanced.ids.windowId).not.toBe(initialIds.windowId);
+    expect(w.snapshot().prefillInputTokens).toBeNull();
     // After reset, no growth again
     expect(w.bodyAfterPrefix(400)).toBe(0);
+  });
+
+  // mirrors claim_token_budget_reminder / claim_auto_compact_fallback +
+  // request_new_context_window (auto_compact_window.rs:88-104).
+  it("per-window flags are one-shot and reset on advance", () => {
+    const w = new AutoCompactWindow();
+    expect(w.claimTokenBudgetReminder()).toBe(true);
+    expect(w.claimTokenBudgetReminder()).toBe(false);
+    expect(w.claimAutoCompactFallback()).toBe(true);
+    expect(w.claimAutoCompactFallback()).toBe(false);
+
+    w.requestNewContextWindow();
+    expect(w.takeNewContextWindowRequest()).toBe(true);
+    expect(w.takeNewContextWindowRequest()).toBe(false);
+
+    w.requestNewContextWindow();
+    w.advance();
+    // advance() clears a pending request and re-arms both one-shot flags
+    expect(w.takeNewContextWindowRequest()).toBe(false);
+    expect(w.claimTokenBudgetReminder()).toBe(true);
+    expect(w.claimAutoCompactFallback()).toBe(true);
+  });
+
+  // mirrors restore() (auto_compact_window.rs:72)
+  it("restore reinstates a persisted window number and ids", () => {
+    const w = new AutoCompactWindow();
+    const ids = {
+      firstWindowId: "first",
+      previousWindowId: "prev",
+      windowId: "current",
+    };
+    w.restore(3, ids);
+    expect(w.currentWindowNumber()).toBe(3);
+    expect(w.currentIds()).toEqual(ids);
   });
 });
 
@@ -93,6 +137,25 @@ describe("collectUserMessages", () => {
       { type: "function_call", call_id: "c1", name: "tool", arguments: "{}" },
     ];
     expect(collectUserMessages(history)).toEqual([]);
+  });
+
+  // mirrors collect_user_messages's is_summary_message filter (compact.rs:529):
+  // a previous compaction summary is NOT a user message, so a second compaction
+  // must not re-collect it and stack summaries on top of each other.
+  it("skips a previous compaction summary", () => {
+    const previousSummary = `${SUMMARY_PREFIX}\nearlier work recap`;
+    const history: ConversationItem[] = [
+      { type: "message", role: "user", content: "first ask" },
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: previousSummary }],
+      },
+      { type: "message", role: "user", content: "next ask" },
+    ];
+    expect(collectUserMessages(history)).toEqual(["first ask", "next ask"]);
+    expect(isSummaryMessage(previousSummary)).toBe(true);
+    expect(isSummaryMessage("first ask")).toBe(false);
   });
 });
 

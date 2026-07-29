@@ -13,6 +13,7 @@ import type {
   Event,
   EventMsg,
   Op,
+  TurnAbortedEvent,
   TurnCompleteEvent,
   TurnStartedEvent,
 } from "../../protocol/src/protocol.js";
@@ -32,8 +33,9 @@ import { runTurn } from "./session/turn.js";
 import { AutoCompactWindow } from "./state/auto_compact_window.js";
 import { SessionTokenState } from "./state/token_state.js";
 import { DEFAULT_BASE_INSTRUCTIONS } from "./base_instructions.js";
-import { renderSkillsCatalog } from "./skills.js";
+import { renderAvailableSkills } from "./skills.js";
 import type { SkillMetadata } from "./skills.js";
+import { codexErrorInfoFor, isAbortError } from "./session/retry.js";
 import type { TurnConfig } from "./session/turn.js";
 import type { PendingInputs } from "./tools/handlers/request_user_input.js";
 
@@ -172,6 +174,12 @@ export interface CodexThreadConfig {
    * stream/request_max_retries. Defaults to 5; pass 0 to disable retries.
    */
   maxRetries?: number | undefined;
+  /**
+   * Overrides the inline-compaction summarization prompt (mirrors codex-rs
+   * `config.compact_prompt`, compact.rs:118). Omit for the bundled
+   * SUMMARIZATION_PROMPT ported from prompts/templates/compact/prompt.md.
+   */
+  compactPrompt?: string | undefined;
 }
 
 interface ResolvedConfig {
@@ -187,6 +195,7 @@ interface ResolvedConfig {
   autoCompactTokenLimit?: number | undefined;
   contextWindow?: number | undefined;
   maxRetries?: number | undefined;
+  compactPrompt?: string | undefined;
 }
 
 // ─── CodexThread ─────────────────────────────────────────────────────────────
@@ -238,6 +247,7 @@ export class CodexThread {
       autoCompactTokenLimit: config.autoCompactTokenLimit,
       contextWindow: config.contextWindow,
       maxRetries: config.maxRetries,
+      compactPrompt: config.compactPrompt,
     };
 
     this.threadId = config.threadId ?? nextId();
@@ -317,13 +327,21 @@ export class CodexThread {
             ],
           });
         }
-        // skills catalog message (codex-rs available-skills fragment).
-        const skillsCatalog = renderSkillsCatalog(this.config.skills);
-        if (skillsCatalog) {
+        // skills catalog message (codex-rs available-skills fragment). The
+        // budget warning is NOT part of the model-visible body — codex-rs sends
+        // it as EventMsg::Warning (session/mod.rs:3393-3402), so we do too.
+        const availableSkills = renderAvailableSkills(this.config.skills);
+        if (availableSkills.body) {
           contextItems.push({
             type: "message",
             role: "user",
-            content: [{ type: "input_text", text: skillsCatalog }],
+            content: [{ type: "input_text", text: availableSkills.body }],
+          });
+        }
+        if (availableSkills.warningMessage) {
+          this.pushEvent(submissionId, {
+            type: "Warning",
+            event: { message: availableSkills.warningMessage },
           });
         }
         const turnConfig: TurnConfig = {
@@ -350,10 +368,18 @@ export class CodexThread {
           ...(this.config.maxRetries !== undefined
             ? { maxRetries: this.config.maxRetries }
             : {}),
+          ...(this.config.compactPrompt !== undefined
+            ? { compactPrompt: this.config.compactPrompt }
+            : {}),
         };
 
         const abortController = new AbortController();
         this.currentTurnAbort = abortController;
+
+        // Unix seconds, mirroring TurnStartedEvent.started_at /
+        // TurnCompleteEvent.started_at (protocol.rs:2019).
+        const startedAtMs = Date.now();
+        const startedAt = Math.floor(startedAtMs / 1000);
 
         this.pushEvent(submissionId, {
           type: "TurnStarted",
@@ -378,13 +404,51 @@ export class CodexThread {
               event: {
                 turn_id: turnId,
                 last_agent_message: lastAgentMessage || undefined,
+                started_at: startedAt,
+                completed_at: Math.floor(Date.now() / 1000),
+                duration_ms: Date.now() - startedAtMs,
               } satisfies TurnCompleteEvent,
             });
           })
           .catch((err: unknown) => {
+            const completedAt = Math.floor(Date.now() / 1000);
+            const durationMs = Date.now() - startedAtMs;
+            const error = {
+              message: String(err),
+              codex_error_info: codexErrorInfoFor(err),
+              turn_id: turnId,
+            };
+            // The Error event is emitted for every failure mode, including an
+            // interrupt — pre-existing codex-ts behaviour that hosts key off.
+            this.pushEvent(submissionId, { type: "Error", event: error });
+            // mirrors tasks/mod.rs:785-794: an ABORTED turn terminates with
+            // TurnAborted, never TurnComplete.
+            if (isAbortError(err)) {
+              this.pushEvent(submissionId, {
+                type: "TurnAborted",
+                event: {
+                  turn_id: turnId,
+                  reason: "interrupted",
+                  started_at: startedAt,
+                  completed_at: completedAt,
+                  duration_ms: durationMs,
+                } satisfies TurnAbortedEvent,
+              });
+              return;
+            }
+            // mirrors tasks/mod.rs:795-813: a failed turn still completes the
+            // turn lifecycle, with the terminal error attached to TurnComplete
+            // (rs reads it from turn_context.terminal_error). Without that
+            // second event a host awaiting TurnComplete would hang on failure.
             this.pushEvent(submissionId, {
-              type: "Error",
-              event: { message: String(err), turn_id: turnId },
+              type: "TurnComplete",
+              event: {
+                turn_id: turnId,
+                error,
+                started_at: startedAt,
+                completed_at: completedAt,
+                duration_ms: durationMs,
+              } satisfies TurnCompleteEvent,
             });
           })
           .finally(() => {

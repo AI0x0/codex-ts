@@ -85,3 +85,29 @@ describe("image UserInput → input_image content part", () => {
     ]);
   });
 });
+
+// mirrors UserInput::Audio → ContentItem::InputAudio (protocol/src/models.rs:1778)
+describe("audio UserInput → input_audio content part", () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("serializes an audio item as input_audio carrying its data URI", async () => {
+    const fetchMock = mockSingleTurn();
+    const codex = new CodexThread({ apiKey: "k", model: "m" });
+    await codex.submit({
+      type: "UserInput",
+      items: [
+        { type: "text", text: "转写这段录音" },
+        { type: "audio", audio_url: "data:audio/webm;base64,AAAA" },
+      ],
+    });
+    await waitForEvent(codex, (m) => m.type === "TurnComplete");
+
+    const content = userContentOf(fetchMock);
+    expect(content).toEqual([
+      { type: "input_text", text: "转写这段录音" },
+      { type: "input_audio", audio_url: "data:audio/webm;base64,AAAA" },
+    ]);
+  });
+});
