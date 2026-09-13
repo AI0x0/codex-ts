@@ -1,6 +1,6 @@
 {
   "name": "@ai0x0/codex-ts",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "type": "module",
   "license": "Apache-2.0",
   "exports": {
@@ -15,6 +15,10 @@
     "./tools": {
       "import": "./dist/tools/src/index.js",
       "types": "./dist/tools/src/index.d.ts"
+    },
+    "./host": {
+      "import": "./dist/host/src/index.js",
+      "types": "./dist/host/src/index.d.ts"
     },
     "./ext/goal": {
       "import": "./dist/ext/goal/src/index.js",

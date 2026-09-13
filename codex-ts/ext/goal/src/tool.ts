@@ -46,7 +46,10 @@ export class GoalToolExecutor {
     // (goals.rs:225): an UNFINISHED goal blocks creation, but a COMPLETE one is
     // replaced (counters reset), so a thread can start its next goal.
     if (this.snapshot !== null && this.snapshot.status !== "Complete") {
-      return { output: JSON.stringify({ error: CREATE_BLOCKED_ERROR }), event: null };
+      return {
+        output: JSON.stringify({ error: CREATE_BLOCKED_ERROR }),
+        event: null,
+      };
     }
     // mirrors handle_create (tool.rs:185-187): trim, then
     // validate_thread_goal_objective (protocol.rs:4055).
@@ -55,8 +58,16 @@ export class GoalToolExecutor {
     if (objectiveError !== null) {
       return { output: JSON.stringify({ error: objectiveError }), event: null };
     }
-    if (token_budget !== undefined && (token_budget <= 0 || !Number.isInteger(token_budget))) {
-      return { output: JSON.stringify({ error: "token_budget must be a positive integer." }), event: null };
+    if (
+      token_budget !== undefined &&
+      (token_budget <= 0 || !Number.isInteger(token_budget))
+    ) {
+      return {
+        output: JSON.stringify({
+          error: "token_budget must be a positive integer.",
+        }),
+        event: null,
+      };
     }
 
     // mirrors handle_create (tool.rs:190-206): the store's create is
@@ -68,7 +79,10 @@ export class GoalToolExecutor {
         token_budget,
       );
       if (created === null) {
-        return { output: JSON.stringify({ error: CREATE_BLOCKED_ERROR }), event: null };
+        return {
+          output: JSON.stringify({ error: CREATE_BLOCKED_ERROR }),
+          event: null,
+        };
       }
       this.snapshot = created;
       return { output: this.formatResponse(), event: this.goalUpdatedEvent() };
@@ -100,19 +114,29 @@ export class GoalToolExecutor {
   // ─── update_goal ────────────────────────────────────────────────────────────
 
   async update(
-    status: "complete" | "blocked",
+    status: "complete" | "blocked" | "paused",
   ): Promise<{ output: string; event: ThreadGoalUpdatedEvent | null }> {
     if (this.snapshot === null) {
-      return { output: JSON.stringify({ error: "No active goal exists." }), event: null };
-    }
-    if (status !== "complete" && status !== "blocked") {
       return {
-        output: JSON.stringify({ error: `Invalid status "${String(status)}". Must be "complete" or "blocked".` }),
+        output: JSON.stringify({ error: "No active goal exists." }),
+        event: null,
+      };
+    }
+    if (status !== "complete" && status !== "blocked" && status !== "paused") {
+      return {
+        output: JSON.stringify({
+          error: `Invalid status "${String(status)}". Must be "complete", "blocked", or "paused".`,
+        }),
         event: null,
       };
     }
 
-    const goalStatus: ThreadGoalStatus = status === "complete" ? "Complete" : "Blocked";
+    const goalStatus: ThreadGoalStatus =
+      status === "complete"
+        ? "Complete"
+        : status === "paused"
+          ? "Paused"
+          : "Blocked";
 
     if (this.store) {
       await this.store.updateThreadGoal(this.threadId, { status: goalStatus });
@@ -130,7 +154,11 @@ export class GoalToolExecutor {
   async recordTokens(count: number, elapsedSeconds = 0): Promise<void> {
     if (this.snapshot === null) return;
     if (this.store) {
-      const outcome = await this.store.accountTokens(this.threadId, count, elapsedSeconds);
+      const outcome = await this.store.accountTokens(
+        this.threadId,
+        count,
+        elapsedSeconds,
+      );
       if (outcome.kind === "Updated") {
         this.snapshot = outcome.goal;
         return;
@@ -152,13 +180,19 @@ export class GoalToolExecutor {
 
   private formatResponse(): string {
     if (this.snapshot === null) {
-      return JSON.stringify({ goal: null, remaining_tokens: null } satisfies GoalToolResponse);
+      return JSON.stringify({
+        goal: null,
+        remaining_tokens: null,
+      } satisfies GoalToolResponse);
     }
     const remaining_tokens =
       this.snapshot.token_budget !== undefined
         ? this.snapshot.token_budget - this.snapshot.tokens_used
         : null;
-    return JSON.stringify({ goal: this.snapshot, remaining_tokens } satisfies GoalToolResponse);
+    return JSON.stringify({
+      goal: this.snapshot,
+      remaining_tokens,
+    } satisfies GoalToolResponse);
   }
 
   private goalUpdatedEvent(): ThreadGoalUpdatedEvent | null {

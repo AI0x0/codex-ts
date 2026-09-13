@@ -18,6 +18,7 @@
     "protocol/src",
     "tools/src",
     "ext/goal/src",
+    "host/src",
     "thread-store/src",
     "state/src",
     "core/src",

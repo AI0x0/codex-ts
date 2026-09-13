@@ -18,17 +18,43 @@ export function approxTokenCount(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
+function textBytes(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
 /**
- * Estimate the token size of serialized conversation items.
- * mirrors history.estimate_token_count_with_base_instructions (history.rs:149):
- * per-item byte-based estimates, summed. JSON form approximates wire size.
+ * Approximate the model-visible byte cost of one conversation item.
+ * mirrors estimate_response_item_model_visible_bytes (history.rs:830): count
+ * content directly and exclude transport IDs, metadata, and outer JSON escaping.
+ */
+function estimateItemBytes(item: ConversationItem): number {
+  if (item.type !== "message") {
+    if (item.type === "function_call") {
+      return textBytes(item.name) + textBytes(item.arguments);
+    }
+    return textBytes(item.output);
+  }
+  if (typeof item.content === "string") {
+    return textBytes(item.content);
+  }
+  return item.content.reduce((total, part) => {
+    if (part.type === "input_text") return total + textBytes(part.text);
+    if (part.type === "input_image") return total + 7_373;
+    // A data URI is not model-visible bytes, but keeps a conservative floor.
+    if (part.type === "input_audio") return total + 7_373;
+    return total;
+  }, 0);
+}
+
+/**
+ * Estimate the token size of conversation items from their model-visible
+ * content. mirrors history.estimate_token_count_with_base_instructions
+ * (history.rs:454): per-item content estimates, summed.
  */
 export function estimateItemsTokenCount(items: ConversationItem[]): number {
-  let total = 0;
-  for (const item of items) {
-    total += approxTokenCount(JSON.stringify(item));
-  }
-  return total;
+  let bytes = 0;
+  for (const item of items) bytes += estimateItemBytes(item);
+  return Math.ceil(bytes / 4);
 }
 
 export class SessionTokenState {

@@ -135,6 +135,7 @@ export function isRetryableError(error: unknown): boolean {
  *   - insufficient_quota  → CodexErr::QuotaExceeded
  *   - usage_not_included  → CodexErr::UsageNotIncluded
  *   - cyber_policy        → CodexErr::CyberPolicy
+ *   - misalignment_policy_violation → CodexErr::MisalignmentPolicyViolation
  *   - invalid_prompt / bio_policy → CodexErr::InvalidRequest
  *   - server_is_overloaded / slow_down → CodexErr::ServerOverloaded
  * (context_length_exceeded is terminal too, but is handled separately because
@@ -144,6 +145,7 @@ const TERMINAL_STREAM_FAILURE_CODES = new Set<string>([
   "insufficient_quota",
   "usage_not_included",
   "cyber_policy",
+  "misalignment_policy_violation",
   "invalid_prompt",
   "bio_policy",
   "server_is_overloaded",
@@ -191,7 +193,9 @@ export function parseRateLimitRetryAfterMs(
  * The 503 status is a stand-in for "stream-level failure, no HTTP status" so the
  * retryable ones land in isRetryableStatus's set.
  */
-export function classifyStreamFailure(raw: Record<string, unknown>): ResponsesApiError {
+export function classifyStreamFailure(
+  raw: Record<string, unknown>,
+): ResponsesApiError {
   const kind = String(raw["type"] ?? "");
   const response = raw["response"] as Record<string, unknown> | undefined;
 
@@ -211,19 +215,20 @@ export function classifyStreamFailure(raw: Record<string, unknown>): ResponsesAp
   const code = typeof error?.["code"] === "string" ? error["code"] : undefined;
   const message =
     typeof error?.["message"] === "string" ? error["message"] : undefined;
-  const body = error !== undefined ? JSON.stringify(error) : JSON.stringify(raw);
+  const body =
+    error !== undefined ? JSON.stringify(error) : JSON.stringify(raw);
 
-  const terminal = code !== undefined && TERMINAL_STREAM_FAILURE_CODES.has(code);
+  const terminal =
+    code !== undefined && TERMINAL_STREAM_FAILURE_CODES.has(code);
   const retryAfterMs = parseRateLimitRetryAfterMs(code, message);
   return new ResponsesApiError(503, body, retryAfterMs, terminal);
 }
 
 export function isAbortError(error: unknown): boolean {
   return (
-    error instanceof DOMException &&
-    error.name === "AbortError"
-  ) ||
-    (error instanceof Error && error.name === "AbortError");
+    (error instanceof DOMException && error.name === "AbortError") ||
+    (error instanceof Error && error.name === "AbortError")
+  );
 }
 
 /**
@@ -294,6 +299,12 @@ export function codexErrorInfoFor(
   if (has("cyber_policy")) {
     return { type: "cyber_policy" };
   }
+  if (has("misalignment_policy_violation")) {
+    return { type: "misalignment_policy_violation" };
+  }
+  if (has("rate_limit_exceeded")) {
+    return { type: "rate_limit_exceeded" };
+  }
   if (has("server_is_overloaded") || has("slow_down")) {
     return { type: "server_overloaded" };
   }
@@ -326,7 +337,10 @@ export function codexErrorInfoFor(
  * Abortable sleep. Rejects with an AbortError if the signal fires first, so a
  * mid-backoff interrupt cancels the turn promptly.
  */
-export function sleep(ms: number, signal?: AbortSignal | undefined): Promise<void> {
+export function sleep(
+  ms: number,
+  signal?: AbortSignal | undefined,
+): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       reject(new DOMException("Aborted", "AbortError"));

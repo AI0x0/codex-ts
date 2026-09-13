@@ -5,8 +5,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { CodexThread } from "../../src/codex_thread.js";
 import {
-  MAX_AUTO_RESOLUTION_MS,
-  MIN_AUTO_RESOLUTION_MS,
+  createRequestUserInputTool,
   normalizeRequestUserInputArgs,
 } from "../../src/tools/handlers/request_user_input_spec.js";
 import type { EventMsg } from "../../../protocol/src/protocol.js";
@@ -22,7 +21,9 @@ import {
   makeSseResponse,
 } from "../common/lib.js";
 
-beforeEach(() => { vi.unstubAllGlobals(); });
+beforeEach(() => {
+  vi.unstubAllGlobals();
+});
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -76,8 +77,7 @@ describe("request_user_input_round_trip_resolves_pending", () => {
     // Wait for the agent to request user input
     const request = await waitForEventMatch<RequestUserInputEvent>(
       codex,
-      (msg) =>
-        msg.type === "RequestUserInput" ? msg.event : null,
+      (msg) => (msg.type === "RequestUserInput" ? msg.event : null),
     );
 
     expect(request.call_id).toBe(callId);
@@ -256,102 +256,27 @@ describe("normalizeRequestUserInputArgs guards a malformed questions field", () 
     });
     expect("questions" in result && result.questions[0]?.isOther).toBe(true);
   });
-});
 
-// mirrors the auto_resolution_ms clamp (request_user_input_spec.rs:123)
-describe("normalizeRequestUserInputArgs clamps autoResolutionMs", () => {
-  const question = {
-    id: "q1",
-    header: "Q",
-    question: "Pick?",
-    options: [{ label: "A", description: "a" }],
-  };
-
-  it("keeps an in-range window", () => {
+  // Upstream removed autoResolutionMs from the tool schema and event contract.
+  it("omits autoResolutionMs even when an older model sends it", () => {
+    const spec = createRequestUserInputTool().tool;
+    expect(Object.keys(spec.parameters.properties ?? {})).not.toContain(
+      "autoResolutionMs",
+    );
     const result = normalizeRequestUserInputArgs({
-      questions: [question],
+      questions: [
+        {
+          id: "q1",
+          header: "Q",
+          question: "Pick?",
+          options: [{ label: "A", description: "a" }],
+        },
+      ],
       autoResolutionMs: 90_000,
-    });
-    expect("questions" in result && result.autoResolutionMs).toBe(90_000);
-  });
-
-  it("clamps below MIN and above MAX", () => {
-    const low = normalizeRequestUserInputArgs({
-      questions: [question],
-      autoResolutionMs: 1_000,
-    });
-    expect("questions" in low && low.autoResolutionMs).toBe(MIN_AUTO_RESOLUTION_MS);
-
-    const high = normalizeRequestUserInputArgs({
-      questions: [question],
-      autoResolutionMs: 999_999,
-    });
-    expect("questions" in high && high.autoResolutionMs).toBe(MAX_AUTO_RESOLUTION_MS);
-  });
-
-  it("omits the field when absent or non-numeric", () => {
-    const absent = normalizeRequestUserInputArgs({ questions: [question] });
-    expect("questions" in absent && absent.autoResolutionMs).toBeUndefined();
-
-    const bogus = normalizeRequestUserInputArgs({
-      questions: [question],
-      autoResolutionMs: "soon",
-    });
-    expect("questions" in bogus && bogus.autoResolutionMs).toBeUndefined();
-  });
-});
-
-describe("request_user_input forwards autoResolutionMs to the event", () => {
-  it("emits the clamped window on RequestUserInput", async () => {
-    const callId = "call-rui-auto";
-    const fetchMock = vi.fn();
-    fetchMock.mockResolvedValueOnce(
-      makeSseResponse(
-        sseFlat([
-          evResponseCreated("resp-1"),
-          evFunctionCall(callId, "request_user_input", {
-            questions: [
-              {
-                id: "confirm_path",
-                header: "Confirm",
-                question: "Proceed?",
-                options: [{ label: "Yes", description: "Continue." }],
-              },
-            ],
-            autoResolutionMs: 10,
-          }),
-          evCompleted("resp-1"),
-        ]),
-      ),
-    );
-    fetchMock.mockResolvedValue(
-      makeSseResponse(
-        sseFlat([
-          evResponseCreated("resp-2"),
-          evAssistantMessage("done"),
-          evCompleted("resp-2"),
-        ]),
-      ),
-    );
-    vi.stubGlobal("fetch", fetchMock);
-
-    const codex = new CodexThread({ apiKey: "k", model: "m" });
-    await codex.submit({
-      type: "UserInput",
-      items: [{ type: "text", text: "deploy" }],
-    });
-
-    const event = await waitForEventMatch<RequestUserInputEvent>(
-      codex,
-      (msg: EventMsg) => (msg.type === "RequestUserInput" ? msg.event : null),
-    );
-    expect(event.autoResolutionMs).toBe(MIN_AUTO_RESOLUTION_MS);
-
-    await codex.submit({
-      type: "UserInputAnswer",
-      id: event.turn_id,
-      response: { answers: { confirm_path: { answers: ["Yes"] } } },
-    });
-    await waitForEvent(codex, (m) => m.type === "TurnComplete");
+    } as never);
+    expect("questions" in result).toBe(true);
+    if ("questions" in result) {
+      expect("autoResolutionMs" in result).toBe(false);
+    }
   });
 });

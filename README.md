@@ -2,7 +2,7 @@
 
 A lightweight TypeScript agent harness that mirrors the architecture of [openai/codex](https://github.com/openai/codex) (`codex-rs`) — runs in the **browser** and **Node.js** with zero native dependencies.
 
-Forked from [`openai/codex@4f6eaf7a`](https://github.com/openai/codex/commit/4f6eaf7af). All new code lives in `codex-ts/`; upstream files are untouched.
+Forked from [`openai/codex@a592c38c`](https://github.com/openai/codex/commit/a592c38cf). All new code lives in `codex-ts/`; upstream files are untouched.
 
 [中文文档](./README.zh.md)
 
@@ -48,7 +48,8 @@ await thread.submit({
 
 for (;;) {
   const { msg } = await thread.nextEvent();
-  if (msg.type === "AgentMessageContentDelta") process.stdout.write(msg.event.delta);
+  if (msg.type === "AgentMessageContentDelta")
+    process.stdout.write(msg.event.delta);
   if (msg.type === "TurnComplete") break;
 }
 ```
@@ -88,11 +89,11 @@ const thread = new CodexThread({
 
 Submit an operation; returns `submission_id`. Mirrors `pub async fn submit(&self, op: Op) -> CodexResult<String>`.
 
-| `op.type` | Description |
-|---|---|
-| `UserInput` | Send a user message, starts a new turn. `items` accept `{type:"text"}`, `{type:"image", image_url}` and `{type:"audio", audio_url}` (a data URI → `input_audio`, mirroring `UserInput::Audio`). Optional `model` and `instructions` fields override the thread-level defaults for this turn only |
-| `UserInputAnswer` | Answer a `request_user_input` call; `id` = `RequestUserInputEvent.turn_id` |
-| `Interrupt` | Abort the in-flight turn (cancels the pending `fetch` via `AbortController`) |
+| `op.type`         | Description                                                                                                                                                                                                                                                                                      |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `UserInput`       | Send a user message, starts a new turn. `items` accept `{type:"text"}`, `{type:"image", image_url}` and `{type:"audio", audio_url}` (a data URI → `input_audio`, mirroring `UserInput::Audio`). Optional `model` and `instructions` fields override the thread-level defaults for this turn only |
+| `UserInputAnswer` | Answer a `request_user_input` call; `id` = `RequestUserInputEvent.turn_id`                                                                                                                                                                                                                       |
+| `Interrupt`       | Abort the in-flight turn (cancels the pending `fetch` via `AbortController`)                                                                                                                                                                                                                     |
 
 #### `nextEvent(): Promise<Event>`
 
@@ -100,7 +101,7 @@ Pull the next event; blocks until one is available. Mirrors `pub async fn next_e
 
 ```ts
 interface Event {
-  id: string;   // submission_id
+  id: string; // submission_id
   msg: EventMsg;
 }
 ```
@@ -113,21 +114,21 @@ Async factory — use instead of `new` when resuming an existing thread. Loads c
 
 ## Events (EventMsg)
 
-| `msg.type` | Description |
-|---|---|
-| `TurnStarted` | A new turn has begun |
-| `TurnComplete` | Turn finished — emitted on success **and** failure. Carries `last_agent_message`, `started_at` / `completed_at` / `duration_ms`, and `error` when the turn failed (mirrors codex-rs `tasks/mod.rs`) |
-| `TurnAborted` | Terminal event for an interrupted turn (`reason: "interrupted"`); replaces `TurnComplete` in that case, as in codex-rs |
-| `AgentMessage` | Complete assistant message |
-| `AgentMessageContentDelta` | Streaming text chunk |
-| `ReasoningContentDelta` | Streaming reasoning chunk, with `item_id` + `summary_index` so separate reasoning blocks stay distinct |
-| `RequestUserInput` | Model is asking the user; submit `UserInputAnswer` to resume. `autoResolutionMs` (when present) means the question is non-blocking and may be auto-resolved after that window |
-| `ThreadGoalUpdated` | Goal state changed |
-| `PlanUpdate` | Task checklist updated with step list and statuses |
-| `ContextCompacted` | Inline compaction ran; history has been replaced with a summary |
-| `TokenCount` | Recorded token usage after each sampled response (`cache_write_input_tokens` included) |
-| `Warning` | Advisory (e.g. post-compaction thread hygiene reminder, skills-budget notice) |
-| `Error` | Execution error; `codex_error_info` classifies it (`context_window_exceeded`, `usage_limit_exceeded`, `cyber_policy`, `bad_request`, …) so hosts don't have to match message text |
+| `msg.type`                 | Description                                                                                                                                                                                         |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TurnStarted`              | A new turn has begun                                                                                                                                                                                |
+| `TurnComplete`             | Turn finished — emitted on success **and** failure. Carries `last_agent_message`, `started_at` / `completed_at` / `duration_ms`, and `error` when the turn failed (mirrors codex-rs `tasks/mod.rs`) |
+| `TurnAborted`              | Terminal event for an interrupted turn (`reason: "interrupted"`); replaces `TurnComplete` in that case, as in codex-rs                                                                              |
+| `AgentMessage`             | Complete assistant message                                                                                                                                                                          |
+| `AgentMessageContentDelta` | Streaming text chunk                                                                                                                                                                                |
+| `ReasoningContentDelta`    | Streaming reasoning chunk, with `item_id` + `summary_index` so separate reasoning blocks stay distinct                                                                                              |
+| `RequestUserInput`         | Model is asking the user; submit `UserInputAnswer` to resume. `autoResolutionMs` (when present) means the question is non-blocking and may be auto-resolved after that window                       |
+| `ThreadGoalUpdated`        | Goal state changed                                                                                                                                                                                  |
+| `PlanUpdate`               | Task checklist updated with step list and statuses                                                                                                                                                  |
+| `ContextCompacted`         | Inline compaction ran; history has been replaced with a summary                                                                                                                                     |
+| `TokenCount`               | Recorded token usage after each sampled response (`cache_write_input_tokens` included)                                                                                                              |
+| `Warning`                  | Advisory (e.g. post-compaction thread hygiene reminder, skills-budget notice)                                                                                                                       |
+| `Error`                    | Execution error; `codex_error_info` classifies it (`context_window_exceeded`, `usage_limit_exceeded`, `cyber_policy`, `bad_request`, …) so hosts don't have to match message text                   |
 
 A failing turn emits `Error` **and then** `TurnComplete` (with `error` set), so a
 loop that awaits `TurnComplete` never hangs. An **interrupted** turn ends with
@@ -255,12 +256,12 @@ interface GoalBackend {
 
 ### Built-in implementations
 
-| Class | Use |
-|---|---|
+| Class                 | Use                                                   |
+| --------------------- | ----------------------------------------------------- |
 | `InMemoryThreadStore` | No persistence; good for tests and ephemeral sessions |
-| `InMemoryIoBackend` | In-memory I/O; development and testing |
-| `LocalThreadStore` | Wraps any `IoBackend` into a full `ThreadStore` |
-| `InMemoryGoalBackend` | In-memory goal store (default) |
+| `InMemoryIoBackend`   | In-memory I/O; development and testing                |
+| `LocalThreadStore`    | Wraps any `IoBackend` into a full `ThreadStore`       |
+| `InMemoryGoalBackend` | In-memory goal store (default)                        |
 
 ### Node.js filesystem
 
@@ -274,14 +275,14 @@ const fsBackend: IoBackend = {
     await fs.appendFile(path.join(".codex", `${threadId}.jsonl`), line + "\n");
   },
   async readLines(threadId) {
-    const text = await fs.readFile(
-      path.join(".codex", `${threadId}.jsonl`), "utf8"
-    ).catch(() => "");
+    const text = await fs
+      .readFile(path.join(".codex", `${threadId}.jsonl`), "utf8")
+      .catch(() => "");
     return text.split("\n").filter(Boolean);
   },
   async listThreadIds() {
     const files = await fs.readdir(".codex").catch(() => [] as string[]);
-    return files.filter(f => f.endsWith(".jsonl")).map(f => f.slice(0, -6));
+    return files.filter((f) => f.endsWith(".jsonl")).map((f) => f.slice(0, -6));
   },
   async deleteThread(threadId) {
     await fs.rm(path.join(".codex", `${threadId}.jsonl`), { force: true });
@@ -299,7 +300,8 @@ const thread = new CodexThread({ apiKey, model, ioBackend: fsBackend });
 import { CodexThread, IndexedDBIoBackend } from "@ai0x0/codex-ts";
 
 const thread = new CodexThread({
-  apiKey, model,
+  apiKey,
+  model,
   ioBackend: new IndexedDBIoBackend(), // persists to IndexedDB automatically
 });
 ```
@@ -347,13 +349,20 @@ import { GoalStore } from "@ai0x0/codex-ts";
 import type { GoalBackend } from "@ai0x0/codex-ts";
 
 const idbGoalBackend: GoalBackend = {
-  async getThreadGoal(threadId) { /* idb.get(threadId) */ },
-  async saveThreadGoal(threadId, goal) { /* idb.put(threadId, goal) */ },
-  async deleteThreadGoal(threadId) { /* idb.delete(threadId) */ },
+  async getThreadGoal(threadId) {
+    /* idb.get(threadId) */
+  },
+  async saveThreadGoal(threadId, goal) {
+    /* idb.put(threadId, goal) */
+  },
+  async deleteThreadGoal(threadId) {
+    /* idb.delete(threadId) */
+  },
 };
 
 const thread = new CodexThread({
-  apiKey, model,
+  apiKey,
+  model,
   ioBackend: opfsBackend,
   goalStore: new GoalStore(idbGoalBackend),
 });
@@ -366,13 +375,14 @@ Use `new CodexThread()` for new threads and `await CodexThread.create()` to resu
 ```ts
 // First session
 const thread = new CodexThread({ apiKey, model, ioBackend: fsBackend });
-const threadId = thread.id;  // save this
+const threadId = thread.id; // save this
 
 // Later — resume
 const resumed = await CodexThread.create({
-  apiKey, model,
-  threadId,               // the saved ID
-  ioBackend: fsBackend,   // same backend
+  apiKey,
+  model,
+  threadId, // the saved ID
+  ioBackend: fsBackend, // same backend
 });
 // History is loaded; the model sees full context on the next submit
 ```
@@ -390,7 +400,7 @@ Mirrors `codex-rs/core/src/compact.rs`. When the context grows past `autoCompact
 3. When `scope_tokens ≥ autoCompactTokenLimit` (or a host called `requestNewContextWindow()`) **and** tool calls remain (mid-turn), compaction fires:
    - A separate request sends the full history + `SUMMARIZATION_PROMPT` (or `compactPrompt`) to the model
    - The summary is prefixed with `SUMMARY_PREFIX` and stored as the last user message
-   - Recent user messages (up to 20 000 tokens) are prepended before the summary — a *previous* summary is skipped, so summaries never stack (`is_summary_message`)
+   - Recent user messages (up to 20 000 tokens) are prepended before the summary — a _previous_ summary is skipped, so summaries never stack (`is_summary_message`)
    - History is replaced in-place; `ContextCompacted` + `Warning` events are emitted
    - The next window opens and the token baseline resets (`startNewContextWindow()` = rs `advance()` + `clear_prefill()`)
 
@@ -425,7 +435,7 @@ import type { RequestUserInputEvent } from "@ai0x0/codex-ts";
 
 export function Chat() {
   const threadRef = useRef<CodexThread | null>(null);
-  const [output, setOutput]   = useState("");
+  const [output, setOutput] = useState("");
   const [pending, setPending] = useState<RequestUserInputEvent | null>(null);
 
   function getThread() {
@@ -442,9 +452,10 @@ export function Chat() {
     await thread.submit({ type: "UserInput", items: [{ type: "text", text }] });
     for (;;) {
       const { msg } = await thread.nextEvent();
-      if (msg.type === "AgentMessageContentDelta") setOutput(p => p + msg.event.delta);
-      if (msg.type === "RequestUserInput")         setPending(msg.event);
-      if (msg.type === "TurnComplete")             break;
+      if (msg.type === "AgentMessageContentDelta")
+        setOutput((p) => p + msg.event.delta);
+      if (msg.type === "RequestUserInput") setPending(msg.event);
+      if (msg.type === "TurnComplete") break;
     }
     setPending(null);
   }, []);
@@ -465,7 +476,7 @@ export function Chat() {
       {pending && (
         <div>
           <p>{pending.questions[0]?.question}</p>
-          {pending.questions[0]?.options?.map(opt => (
+          {pending.questions[0]?.options?.map((opt) => (
             <button key={opt.label} onClick={() => answer(pending, opt.label)}>
               {opt.label}
             </button>
@@ -493,7 +504,8 @@ const thread = new CodexThread({ apiKey, model });
 
 // Append your own text to the default harness
 const thread2 = new CodexThread({
-  apiKey, model,
+  apiKey,
+  model,
   baseInstructions: DEFAULT_BASE_INSTRUCTIONS + "\n\nAlways respond in French.",
 });
 
@@ -515,11 +527,16 @@ import type { SkillMetadata } from "@ai0x0/codex-ts";
 
 // Host discovers skills (e.g. by scanning .agents/skills/)
 const skills: SkillMetadata[] = [
-  { name: "song-analyzer", description: "Analyze a song.", path: ".agents/skills/song-analyzer/SKILL.md" },
+  {
+    name: "song-analyzer",
+    description: "Analyze a song.",
+    path: ".agents/skills/song-analyzer/SKILL.md",
+  },
 ];
 
 const thread = new CodexThread({
-  apiKey, model,
+  apiKey,
+  model,
   skills,
   // Host provides the reader (browser: fetch; Node.js: fs.readFile)
   loadSkillContent: async (skill) => {
@@ -541,7 +558,8 @@ Mirrors `codex-rs/core/src/agents_md.rs` (UserInstructions fragment). Pass the c
 
 ```ts
 const thread = new CodexThread({
-  apiKey, model,
+  apiKey,
+  model,
   instructions: "You are a helpful assistant.",
   agentsMd: `## Project context\nThis is a music platform...`,
 });
@@ -572,7 +590,11 @@ const searchTool: CustomTool = {
       tool: {
         name: "web_search",
         description: "Search the web.",
-        parameters: S.object({ query: S.string("Search query") }, ["query"], false),
+        parameters: S.object(
+          { query: S.string("Search query") },
+          ["query"],
+          false,
+        ),
         strict: false,
       },
     };
@@ -618,6 +640,11 @@ codex-ts/
 ├── ext/goal/src/                    ← codex-rs/ext/goal/src/
 │   ├── spec.ts                      ←   spec.rs            (goal tool schemas)
 │   └── tool.ts                      ←   tool.rs            (GoalToolExecutor)
+│
+├── host/src/                        ← [host extension] process-aware policy/contracts
+│   ├── backend/types.ts             ←   shell_spec/unified_exec wire shape (subset)
+│   ├── approvals/policy.ts          ←   protocol approvals vocabulary (subset)
+│   └── exec/tools.ts                ←   exec_command tool adapter (backend injected)
 │
 ├── thread-store/src/                ← codex-rs/thread-store/src/
 │   ├── store.ts                     ←   store.rs           (ThreadStore interface)
@@ -671,14 +698,14 @@ Only `codex-ts/` is added; the single upstream file change is one line appended 
 
 All implementations in `codex-ts/` were written against codex-rs at:
 
-**[`4f6eaf7a`](https://github.com/openai/codex/commit/4f6eaf7af) — Wait for MCP readiness in the curated sync test (#35794)**
+**[`a592c38c`](https://github.com/openai/codex/commit/a592c38cf) — Use OpenSSL 3.6.4 for musl builds (#45149)**
 
 When syncing, diff from this hash to find what changed in the Rust source and update the corresponding `.ts` file:
 
 ```bash
 # Check what changed in mirrored files
-git diff 4f6eaf7a HEAD -- codex-rs/protocol/src/protocol.rs
-git diff 4f6eaf7a HEAD -- codex-rs/ext/goal/src/spec.rs
+git diff a592c38c HEAD -- codex-rs/protocol/src/protocol.rs
+git diff a592c38c HEAD -- codex-rs/ext/goal/src/spec.rs
 # repeat for each file in the mapping table below
 ```
 
@@ -687,12 +714,12 @@ Update the hash above to the new reference commit after each sync.
 Upstream files that moved between `6bcccb0e` and this commit (useful when a diff
 comes back empty):
 
-| Was | Now |
-|---|---|
-| `core/src/session/turn.rs` — `auto_compact_token_status` | `core/src/session/context_window.rs` — `context_window_token_status` |
-| `core-skills/src/manager.rs` | `core-skills/src/service.rs` |
-| `core-skills/src/render.rs` — `### How to use skills` section | `core/src/context/available_skills_instructions.rs` |
-| `state/auto_compact_window.rs` — `start_next` / `ordinal` | `advance` / `window_number` + `AutoCompactWindowIds` |
+| Was                                                           | Now                                                                  |
+| ------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `core/src/session/turn.rs` — `auto_compact_token_status`      | `core/src/session/context_window.rs` — `context_window_token_status` |
+| `core-skills/src/manager.rs`                                  | `core-skills/src/service.rs`                                         |
+| `core-skills/src/render.rs` — `### How to use skills` section | `core/src/context/available_skills_instructions.rs`                  |
+| `state/auto_compact_window.rs` — `start_next` / `ordinal`     | `advance` / `window_number` + `AutoCompactWindowIds`                 |
 
 Deliberately **not** ported (native-only upstream features with no browser
 counterpart): `token_budget` reminders/fallback prompts (feature-gated config),
@@ -702,37 +729,50 @@ windows), the `new_context` tool (the underlying window roll-over IS available
 via `AutoCompactWindow.requestNewContextWindow()`), and the paginated
 fork/search/model-context additions to `ThreadStore`.
 
+### 2026-09-13 sync notes
+
+Ported the browser-relevant subset: request_user_input no longer exposes or
+forwards autoResolutionMs; update_goal accepts user-requested paused; error
+classification adds rate_limit_exceeded and misalignment_policy_violation;
+history estimates now count model-visible content instead of serialized
+envelopes; and protocol event shapes add newer upstream fields. Native-only
+systems around remote compaction, permissions/approvals, plugins, realtime,
+and app-server APIs remain out of scope.
+
 ### Source comment conventions
 
 Every `.ts` file that has a non-trivial relationship with codex-rs is annotated
 so you know at a glance whether a diff from upstream requires action:
 
-| Comment in source | Meaning | Action on upstream diff |
-|---|---|---|
-| `// mirrors codex-rs/path/to/file.rs` | Direct TypeScript translation | **Check the diff** — likely needs updating |
-| `// mirrors: …` (inline) | Specific field or pattern is the TS equivalent of a named Rust construct | Check if the Rust construct changed |
-| `// Browser-specific extension — no equivalent in codex-rs` | Added on top of the mirror layer; Rust has nothing analogous | **Skip** — upstream changes don't affect this |
-| `// Browser-specific adaptation of …` | Intentional simplification (e.g. `Op.UserInput` vs `ThreadSettingsOverrides`) | Skim the diff to see if new relevant fields should be ported |
+| Comment in source                                           | Meaning                                                                       | Action on upstream diff                                      |
+| ----------------------------------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| `// mirrors codex-rs/path/to/file.rs`                       | Direct TypeScript translation                                                 | **Check the diff** — likely needs updating                   |
+| `// mirrors: …` (inline)                                    | Specific field or pattern is the TS equivalent of a named Rust construct      | Check if the Rust construct changed                          |
+| `// Browser-specific extension — no equivalent in codex-rs` | Added on top of the mirror layer; Rust has nothing analogous                  | **Skip** — upstream changes don't affect this                |
+| `// Browser-specific adaptation of …`                       | Intentional simplification (e.g. `Op.UserInput` vs `ThreadSettingsOverrides`) | Skim the diff to see if new relevant fields should be ported |
 
 ### File mapping
 
-| Upstream change | codex-ts file to update |
-|---|---|
-| `protocol/src/protocol.rs` — new EventMsg variant | `protocol/src/protocol.ts` |
-| `ext/goal/src/spec.rs` — schema change | `ext/goal/src/spec.ts` |
-| `request_user_input_spec.rs` — field change | `core/src/tools/handlers/request_user_input_spec.ts` |
-| `plan_spec.rs` / `plan_tool.rs` — schema change | `core/src/tools/handlers/plan_spec.ts` + `protocol/src/plan_tool.ts` |
-| `thread-store/src/store.rs` — interface change | `thread-store/src/store.ts` |
-| `state/src/runtime/goals.rs` — accounting change | `state/src/runtime/goals.ts` |
-| `compact.rs` — compaction logic change | `core/src/compact.ts` |
-| `state/auto_compact_window.rs` — window tracking change | `core/src/state/auto_compact_window.ts` |
-| `session/context_window.rs` — compaction trigger change | `autoCompactTokenStatus` in `core/src/session/turn.ts` |
-| `prompts/templates/compact/prompt.md` — summarisation prompt | `SUMMARIZATION_PROMPT` in `core/src/compact.ts` |
-| `codex-api/src/sse/responses.rs` — SSE event / error classification | `core/src/session/turn.ts` + `core/src/session/retry.ts` |
-| `protocol/src/error.rs` — `CodexErrorInfo` / retryability | `CodexErrorInfo` in `protocol/src/protocol.ts` + `codexErrorInfoFor` in `core/src/session/retry.ts` |
-| `core-skills/src/render.rs` — catalog text / budget | `core/src/skills.ts` |
-| `protocol/src/user_input.rs` + `models.rs` — new input modality | `protocol/src/user_input.ts` + `UserContentPart` in `thread-store/src/types.ts` |
-| New tool added | `core/src/tools/router.ts` |
+| Upstream change                                                     | codex-ts file to update                                                                             |
+| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `protocol/src/protocol.rs` — new EventMsg variant                   | `protocol/src/protocol.ts`                                                                          |
+| `ext/goal/src/spec.rs` — schema change                              | `ext/goal/src/spec.ts`                                                                              |
+| `request_user_input_spec.rs` — field change                         | `core/src/tools/handlers/request_user_input_spec.ts`                                                |
+| `plan_spec.rs` / `plan_tool.rs` — schema change                     | `core/src/tools/handlers/plan_spec.ts` + `protocol/src/plan_tool.ts`                                |
+| `thread-store/src/store.rs` — interface change                      | `thread-store/src/store.ts`                                                                         |
+| `state/src/runtime/goals.rs` — accounting change                    | `state/src/runtime/goals.ts`                                                                        |
+| `compact.rs` — compaction logic change                              | `core/src/compact.ts`                                                                               |
+| `state/auto_compact_window.rs` — window tracking change             | `core/src/state/auto_compact_window.ts`                                                             |
+| `session/context_window.rs` — compaction trigger change             | `autoCompactTokenStatus` in `core/src/session/turn.ts`                                              |
+| `prompts/templates/compact/prompt.md` — summarisation prompt        | `SUMMARIZATION_PROMPT` in `core/src/compact.ts`                                                     |
+| `codex-api/src/sse/responses.rs` — SSE event / error classification | `core/src/session/turn.ts` + `core/src/session/retry.ts`                                            |
+| `protocol/src/error.rs` — `CodexErrorInfo` / retryability           | `CodexErrorInfo` in `protocol/src/protocol.ts` + `codexErrorInfoFor` in `core/src/session/retry.ts` |
+| `core-skills/src/render.rs` — catalog text / budget                 | `core/src/skills.ts`                                                                                |
+| `protocol/src/user_input.rs` + `models.rs` — new input modality     | `protocol/src/user_input.ts` + `UserContentPart` in `thread-store/src/types.ts`                     |
+| New tool added                                                      | `core/src/tools/router.ts`                                                                          |
+| `tools/handlers/shell_spec.rs` — command schema/approval parameters | `host/src/exec/spec.ts` + `host/src/backend/types.ts`                                               |
+| `tools/sandboxing.rs` — approval / escalation policy                | `host/src/approvals/policy.ts`                                                                      |
+| `sandboxing/seatbelt.rs` + `windows-sandbox-rs`                     | stays in the embedding host backend; do not port into mirror files                                  |
 
 ### Sync workflow
 

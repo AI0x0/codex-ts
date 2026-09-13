@@ -22,7 +22,9 @@ import {
 
 describe("GoalToolExecutor", () => {
   let ex: GoalToolExecutor;
-  beforeEach(() => { ex = new GoalToolExecutor("thread-1"); });
+  beforeEach(() => {
+    ex = new GoalToolExecutor("thread-1");
+  });
 
   it("get returns null goal when none exists", async () => {
     const r = JSON.parse((await ex.get()).output) as { goal: null };
@@ -39,7 +41,9 @@ describe("GoalToolExecutor", () => {
 
   it("create rejects a second goal while the first is unfinished", async () => {
     await ex.create("first");
-    const r = JSON.parse((await ex.create("second")).output) as { error: string };
+    const r = JSON.parse((await ex.create("second")).output) as {
+      error: string;
+    };
     expect(r.error).toMatch(/unfinished goal/);
   });
 
@@ -89,8 +93,19 @@ describe("GoalToolExecutor", () => {
     expect(r.goal.status).toBe("Blocked");
   });
 
+  // mirrors ext/goal/src/tool.rs update_goal accepting ThreadGoalStatus::Paused.
+  it("update marks goal Paused", async () => {
+    await ex.create("finish");
+    const r = JSON.parse((await ex.update("paused")).output) as {
+      goal: { status: string };
+    };
+    expect(r.goal.status).toBe("Paused");
+  });
+
   it("update fails with no goal", async () => {
-    const r = JSON.parse((await ex.update("complete")).output) as { error: string };
+    const r = JSON.parse((await ex.update("complete")).output) as {
+      error: string;
+    };
     expect(r.error).toMatch(/No active goal/);
   });
 
@@ -116,7 +131,9 @@ describe("GoalToolExecutor", () => {
 // ─── Integration: create_goal tool call through CodexThread ───────────────────
 
 describe("create_goal tool call", () => {
-  beforeEach(() => { vi.unstubAllGlobals(); });
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+  });
 
   it("emits ThreadGoalUpdated event and TurnComplete", async () => {
     const fetchMock = vi.fn();
@@ -144,7 +161,10 @@ describe("create_goal tool call", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const codex = new CodexThread({ apiKey: "test", model: "gpt-4o" });
-    await codex.submit({ type: "UserInput", items: [{ type: "text", text: "create a goal" }] });
+    await codex.submit({
+      type: "UserInput",
+      items: [{ type: "text", text: "create a goal" }],
+    });
 
     const goalUpdated = await waitForEventMatch(codex, (msg) =>
       msg.type === "ThreadGoalUpdated" ? msg.event : null,
@@ -154,10 +174,10 @@ describe("create_goal tool call", () => {
 
     const done = await waitForEvent(
       codex,
-      (msg): msg is Extract<EventMsg, { type: "TurnComplete" }> => msg.type === "TurnComplete",
+      (msg): msg is Extract<EventMsg, { type: "TurnComplete" }> =>
+        msg.type === "TurnComplete",
     );
     expect(done.type).toBe("TurnComplete");
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
-

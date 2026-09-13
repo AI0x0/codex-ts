@@ -54,6 +54,15 @@ export function validateThreadGoalObjective(value: string): string | null {
 
 export interface TurnStartedEvent {
   turn_id: string;
+  /** ID of the originating turn in the root thread; equals turn_id for root turns. */
+  root_turn_id?: string | undefined;
+  /** Persisted for rollout consumers that correlate turns with telemetry traces. */
+  trace_id?: string | undefined;
+  /** Unix timestamp (seconds) when the turn started. */
+  started_at?: number | undefined;
+  model_context_window?: number | null | undefined;
+  /** Browser port has no collaboration modes; retained only for shape parity. */
+  collaboration_mode_kind?: string | undefined;
 }
 
 /**
@@ -74,6 +83,8 @@ export interface TurnCompleteEvent {
   completed_at?: number | undefined;
   /** Turn wall-clock duration in milliseconds, when known. */
   duration_ms?: number | undefined;
+  /** Time to the first model token in milliseconds, when known. */
+  time_to_first_token_ms?: number | undefined;
 }
 
 /** mirrors TurnAbortReason (protocol.rs:4209). codex-ts only ever produces
@@ -104,6 +115,7 @@ export interface AgentMessageEvent {
 
 /** Streaming text chunk — mirrors AgentMessageContentDeltaEvent */
 export interface AgentMessageContentDeltaEvent {
+  thread_id?: string;
   turn_id: string;
   item_id: string;
   delta: string;
@@ -114,6 +126,7 @@ export interface AgentMessageContentDeltaEvent {
  *  its reasoning/thinking, before any final output_text. Lets hosts show a
  *  "thinking" state only while truly reasoning. */
 export interface ReasoningContentDeltaEvent {
+  thread_id?: string;
   turn_id: string;
   /** Reasoning item this delta belongs to — mirrors item_id (protocol.rs:1876). */
   item_id: string;
@@ -148,6 +161,8 @@ export type CodexErrorInfo =
   | { type: "usage_limit_exceeded" }
   | { type: "server_overloaded" }
   | { type: "cyber_policy" }
+  | { type: "misalignment_policy_violation" }
+  | { type: "rate_limit_exceeded" }
   | { type: "http_connection_failed"; http_status_code?: number | undefined }
   | {
       type: "response_stream_connection_failed";
@@ -166,6 +181,10 @@ export type CodexErrorInfo =
       http_status_code?: number | undefined;
     }
   | { type: "thread_rollback_failed" }
+  | {
+      type: "active_turn_not_steerable";
+      turn_kind: "review" | "compact";
+    }
   | { type: "other" };
 
 export interface ErrorEvent {

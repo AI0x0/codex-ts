@@ -2,7 +2,7 @@
 
 轻量级 TypeScript agent harness，完全照搬 [openai/codex](https://github.com/openai/codex) Rust 实现（`codex-rs`）的架构设计，可在**浏览器**和 **Node.js** 中直接运行，无任何原生依赖。
 
-本仓库 fork 自 [`openai/codex@4f6eaf7a`](https://github.com/openai/codex/commit/4f6eaf7af)，新增代码全部在 `codex-ts/` 目录，不修改上游文件。
+本仓库 fork 自 [`openai/codex@a592c38c`](https://github.com/openai/codex/commit/a592c38cf)，新增代码全部在 `codex-ts/` 目录，不修改上游文件。
 
 ---
 
@@ -46,7 +46,8 @@ await thread.submit({
 
 for (;;) {
   const { msg } = await thread.nextEvent();
-  if (msg.type === "AgentMessageContentDelta") process.stdout.write(msg.event.delta);
+  if (msg.type === "AgentMessageContentDelta")
+    process.stdout.write(msg.event.delta);
   if (msg.type === "TurnComplete") break;
 }
 ```
@@ -85,11 +86,11 @@ const thread = new CodexThread({
 
 提交操作，返回 `submission_id`。对应 Rust 的 `pub async fn submit(&self, op: Op) -> CodexResult<String>`。
 
-| `op.type` | 说明 |
-|---|---|
-| `UserInput` | 发送用户消息，触发新一轮。`items` 支持 `{type:"text"}`、`{type:"image", image_url}` 和 `{type:"audio", audio_url}`（data URI，序列化为 `input_audio`，照搬 `UserInput::Audio`）。可选 `model` / `instructions` 字段覆盖本轮的线程级默认值 |
-| `UserInputAnswer` | 回答 `request_user_input`，`id` = `RequestUserInputEvent.turn_id` |
-| `Interrupt` | 中断当前正在执行的轮次（通过 `AbortController` 取消挂起的 `fetch`） |
+| `op.type`         | 说明                                                                                                                                                                                                                                      |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `UserInput`       | 发送用户消息，触发新一轮。`items` 支持 `{type:"text"}`、`{type:"image", image_url}` 和 `{type:"audio", audio_url}`（data URI，序列化为 `input_audio`，照搬 `UserInput::Audio`）。可选 `model` / `instructions` 字段覆盖本轮的线程级默认值 |
+| `UserInputAnswer` | 回答 `request_user_input`，`id` = `RequestUserInputEvent.turn_id`                                                                                                                                                                         |
+| `Interrupt`       | 中断当前正在执行的轮次（通过 `AbortController` 取消挂起的 `fetch`）                                                                                                                                                                       |
 
 #### `nextEvent(): Promise<Event>`
 
@@ -97,7 +98,7 @@ const thread = new CodexThread({
 
 ```ts
 interface Event {
-  id: string;   // submission_id
+  id: string; // submission_id
   msg: EventMsg;
 }
 ```
@@ -106,21 +107,21 @@ interface Event {
 
 ## 支持的事件（EventMsg）
 
-| `msg.type` | 说明 |
-|---|---|
-| `TurnStarted` | 新一轮开始 |
-| `TurnComplete` | 本轮结束——成功与失败都会发。含 `last_agent_message`、`started_at` / `completed_at` / `duration_ms`，失败时带 `error`（照搬 codex-rs `tasks/mod.rs`） |
-| `TurnAborted` | 被中断轮次的终止事件（`reason: "interrupted"`），此时不再发 `TurnComplete`——与 codex-rs 一致 |
-| `AgentMessage` | 模型完整消息 |
-| `AgentMessageContentDelta` | 流式文字片段 |
-| `ReasoningContentDelta` | 流式 reasoning 片段，带 `item_id` + `summary_index` 以区分多段 reasoning |
-| `RequestUserInput` | 模型提问，需提交 `UserInputAnswer` 恢复。带 `autoResolutionMs` 时表示该提问非阻塞，超时后可自行按最佳判断继续 |
-| `ThreadGoalUpdated` | goal 状态变更 |
-| `PlanUpdate` | 任务清单更新，含步骤列表和各步骤状态 |
-| `ContextCompacted` | 内联压缩已执行，历史已替换为摘要 |
-| `TokenCount` | 每次采样后的 token 用量（含 `cache_write_input_tokens`） |
-| `Warning` | 建议信息（如压缩后的线程卫生提醒、skills 预算提示） |
-| `Error` | 执行出错，`codex_error_info` 给出错误分类（`context_window_exceeded`、`usage_limit_exceeded`、`cyber_policy`、`bad_request`…），无需再匹配错误文案 |
+| `msg.type`                 | 说明                                                                                                                                                 |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TurnStarted`              | 新一轮开始                                                                                                                                           |
+| `TurnComplete`             | 本轮结束——成功与失败都会发。含 `last_agent_message`、`started_at` / `completed_at` / `duration_ms`，失败时带 `error`（照搬 codex-rs `tasks/mod.rs`） |
+| `TurnAborted`              | 被中断轮次的终止事件（`reason: "interrupted"`），此时不再发 `TurnComplete`——与 codex-rs 一致                                                         |
+| `AgentMessage`             | 模型完整消息                                                                                                                                         |
+| `AgentMessageContentDelta` | 流式文字片段                                                                                                                                         |
+| `ReasoningContentDelta`    | 流式 reasoning 片段，带 `item_id` + `summary_index` 以区分多段 reasoning                                                                             |
+| `RequestUserInput`         | 模型提问，需提交 `UserInputAnswer` 恢复。带 `autoResolutionMs` 时表示该提问非阻塞，超时后可自行按最佳判断继续                                        |
+| `ThreadGoalUpdated`        | goal 状态变更                                                                                                                                        |
+| `PlanUpdate`               | 任务清单更新，含步骤列表和各步骤状态                                                                                                                 |
+| `ContextCompacted`         | 内联压缩已执行，历史已替换为摘要                                                                                                                     |
+| `TokenCount`               | 每次采样后的 token 用量（含 `cache_write_input_tokens`）                                                                                             |
+| `Warning`                  | 建议信息（如压缩后的线程卫生提醒、skills 预算提示）                                                                                                  |
+| `Error`                    | 执行出错，`codex_error_info` 给出错误分类（`context_window_exceeded`、`usage_limit_exceeded`、`cyber_policy`、`bad_request`…），无需再匹配错误文案   |
 
 失败的轮次会先发 `Error`、随后再发一条带 `error` 的 `TurnComplete`，所以等
 `TurnComplete` 的循环不会卡死；被**中断**的轮次则发 `Error` + `TurnAborted`
@@ -138,7 +139,8 @@ interface Event {
 const thread = new CodexThread({
   apiKey: "sk-...",
   model: "gpt-4o",
-  instructions: "接到复杂任务时先调用 create_goal 设定目标，完成后调用 update_goal 标记 complete。",
+  instructions:
+    "接到复杂任务时先调用 create_goal 设定目标，完成后调用 update_goal 标记 complete。",
 });
 
 for (;;) {
@@ -246,12 +248,12 @@ interface GoalBackend {
 
 ### 内置实现
 
-| 类 | 用途 |
-|---|---|
-| `InMemoryThreadStore` | 无持久化，适合测试和临时会话 |
-| `InMemoryIoBackend` | 内存版 I/O，用于开发和测试 |
-| `LocalThreadStore` | 包装任意 `IoBackend` → 完整 `ThreadStore` |
-| `InMemoryGoalBackend` | 内存版 goal 存储（默认） |
+| 类                    | 用途                                      |
+| --------------------- | ----------------------------------------- |
+| `InMemoryThreadStore` | 无持久化，适合测试和临时会话              |
+| `InMemoryIoBackend`   | 内存版 I/O，用于开发和测试                |
+| `LocalThreadStore`    | 包装任意 `IoBackend` → 完整 `ThreadStore` |
+| `InMemoryGoalBackend` | 内存版 goal 存储（默认）                  |
 
 ### Node.js 文件系统
 
@@ -265,12 +267,14 @@ const fsBackend: IoBackend = {
     await fs.appendFile(path.join(".codex", `${threadId}.jsonl`), line + "\n");
   },
   async readLines(threadId) {
-    const text = await fs.readFile(path.join(".codex", `${threadId}.jsonl`), "utf8").catch(() => "");
+    const text = await fs
+      .readFile(path.join(".codex", `${threadId}.jsonl`), "utf8")
+      .catch(() => "");
     return text.split("\n").filter(Boolean);
   },
   async listThreadIds() {
     const files = await fs.readdir(".codex").catch(() => [] as string[]);
-    return files.filter(f => f.endsWith(".jsonl")).map(f => f.slice(0, -6));
+    return files.filter((f) => f.endsWith(".jsonl")).map((f) => f.slice(0, -6));
   },
   async deleteThread(threadId) {
     await fs.rm(path.join(".codex", `${threadId}.jsonl`), { force: true });
@@ -288,7 +292,8 @@ const thread = new CodexThread({ apiKey, model, ioBackend: fsBackend });
 import { CodexThread, IndexedDBIoBackend } from "@ai0x0/codex-ts";
 
 const thread = new CodexThread({
-  apiKey, model,
+  apiKey,
+  model,
   ioBackend: new IndexedDBIoBackend(), // 自动持久化到 IndexedDB
 });
 ```
@@ -337,13 +342,20 @@ const thread = new CodexThread({ apiKey, model, ioBackend: opfsBackend });
 import { GoalStore, GoalBackend } from "@ai0x0/codex-ts";
 
 const idbGoalBackend: GoalBackend = {
-  async getThreadGoal(threadId) { /* idb.get(threadId) */ },
-  async saveThreadGoal(threadId, goal) { /* idb.put(threadId, goal) */ },
-  async deleteThreadGoal(threadId) { /* idb.delete(threadId) */ },
+  async getThreadGoal(threadId) {
+    /* idb.get(threadId) */
+  },
+  async saveThreadGoal(threadId, goal) {
+    /* idb.put(threadId, goal) */
+  },
+  async deleteThreadGoal(threadId) {
+    /* idb.delete(threadId) */
+  },
 };
 
 const thread = new CodexThread({
-  apiKey, model,
+  apiKey,
+  model,
   ioBackend: opfsBackend,
   goalStore: new GoalStore(idbGoalBackend),
 });
@@ -356,9 +368,12 @@ const thread = new CodexThread({
 ```ts
 // 第一次对话
 const thread = new CodexThread({ apiKey, model, ioBackend: fsBackend });
-const threadId = thread.id;   // 保存这个 ID
+const threadId = thread.id; // 保存这个 ID
 
-await thread.submit({ type: "UserInput", items: [{ type: "text", text: "你好" }] });
+await thread.submit({
+  type: "UserInput",
+  items: [{ type: "text", text: "你好" }],
+});
 for (;;) {
   const { msg } = await thread.nextEvent();
   if (msg.type === "TurnComplete") break;
@@ -366,12 +381,16 @@ for (;;) {
 
 // 进程重启后 resume —— 用 create() 而不是 new
 const resumed = await CodexThread.create({
-  apiKey, model,
-  threadId,                   // 传入之前的 ID
-  ioBackend: fsBackend,       // 同一个 backend
+  apiKey,
+  model,
+  threadId, // 传入之前的 ID
+  ioBackend: fsBackend, // 同一个 backend
 });
 // 历史已从 backend 加载，再 submit 时模型能看到完整上下文
-await resumed.submit({ type: "UserInput", items: [{ type: "text", text: "继续" }] });
+await resumed.submit({
+  type: "UserInput",
+  items: [{ type: "text", text: "继续" }],
+});
 ```
 
 ---
@@ -422,7 +441,7 @@ import type { RequestUserInputEvent } from "@ai0x0/codex-ts";
 
 export function Chat() {
   const threadRef = useRef<CodexThread | null>(null);
-  const [output, setOutput]   = useState("");
+  const [output, setOutput] = useState("");
   const [pending, setPending] = useState<RequestUserInputEvent | null>(null);
 
   function getThread() {
@@ -439,9 +458,10 @@ export function Chat() {
     await thread.submit({ type: "UserInput", items: [{ type: "text", text }] });
     for (;;) {
       const { msg } = await thread.nextEvent();
-      if (msg.type === "AgentMessageContentDelta") setOutput(p => p + msg.event.delta);
-      if (msg.type === "RequestUserInput")         setPending(msg.event);
-      if (msg.type === "TurnComplete")             break;
+      if (msg.type === "AgentMessageContentDelta")
+        setOutput((p) => p + msg.event.delta);
+      if (msg.type === "RequestUserInput") setPending(msg.event);
+      if (msg.type === "TurnComplete") break;
     }
     setPending(null);
   }, []);
@@ -462,7 +482,7 @@ export function Chat() {
       {pending && (
         <div>
           <p>{pending.questions[0]?.question}</p>
-          {pending.questions[0]?.options?.map(opt => (
+          {pending.questions[0]?.options?.map((opt) => (
             <button key={opt.label} onClick={() => answer(pending, opt.label)}>
               {opt.label}
             </button>
@@ -490,7 +510,8 @@ const thread = new CodexThread({ apiKey, model });
 
 // 在默认 harness 后追加自定义内容
 const thread2 = new CodexThread({
-  apiKey, model,
+  apiKey,
+  model,
   baseInstructions: DEFAULT_BASE_INSTRUCTIONS + "\n\n请始终用中文回复。",
 });
 
@@ -512,11 +533,16 @@ import type { SkillMetadata } from "@ai0x0/codex-ts";
 
 // host 扫描技能目录（例如 .agents/skills/）
 const skills: SkillMetadata[] = [
-  { name: "song-analyzer", description: "分析一首歌曲。", path: ".agents/skills/song-analyzer/SKILL.md" },
+  {
+    name: "song-analyzer",
+    description: "分析一首歌曲。",
+    path: ".agents/skills/song-analyzer/SKILL.md",
+  },
 ];
 
 const thread = new CodexThread({
-  apiKey, model,
+  apiKey,
+  model,
   skills,
   // host 提供读取器（浏览器用 fetch，Node.js 用 fs.readFile）
   loadSkillContent: async (skill) => {
@@ -538,7 +564,8 @@ await thread.submit({
 
 ```ts
 const thread = new CodexThread({
-  apiKey, model,
+  apiKey,
+  model,
   instructions: "你是一个助手。",
   agentsMd: `## 项目背景\n这是一个音乐平台...`,
 });
@@ -612,6 +639,11 @@ codex-ts/
 │   ├── spec.ts                      ←   spec.rs            (goal tool schemas)
 │   └── tool.ts                      ←   tool.rs            (GoalToolExecutor)
 │
+├── host/src/                        ← [宿主扩展] 进程策略 / 契约
+│   ├── backend/types.ts             ←   shell_spec/unified_exec wire shape（子集）
+│   ├── approvals/policy.ts          ←   protocol approvals 词汇（子集）
+│   └── exec/tools.ts                ←   exec_command 工具适配（backend 注入）
+│
 ├── thread-store/src/                ← codex-rs/thread-store/src/
 │   ├── store.ts                     ←   store.rs           (ThreadStore interface)
 │   ├── types.ts                     ←   types.rs           (RolloutItem, StoredThread…)
@@ -655,14 +687,14 @@ codex-ts/
 
 `codex-ts/` 的所有实现均对照 codex-rs 在以下提交时的源码逐一照搬：
 
-**[`4f6eaf7a`](https://github.com/openai/codex/commit/4f6eaf7af) — Wait for MCP readiness in the curated sync test (#35794)**
+**[`a592c38c`](https://github.com/openai/codex/commit/a592c38cf) — Use OpenSSL 3.6.4 for musl builds (#45149)**
 
 以后同步上游时，以这个哈希为起点与新版本做 diff，确认哪些 Rust 侧变更需要同步到 codex-ts 的对应 `.ts` 文件：
 
 ```bash
 # 查看上游在参照提交之后的变更
-git diff 4f6eaf7a HEAD -- codex-rs/protocol/src/protocol.rs
-git diff 4f6eaf7a HEAD -- codex-rs/ext/goal/src/spec.rs
+git diff a592c38c HEAD -- codex-rs/protocol/src/protocol.rs
+git diff a592c38c HEAD -- codex-rs/ext/goal/src/spec.rs
 # 依此类推对照上方映射表逐文件检查
 ```
 
@@ -670,12 +702,12 @@ git diff 4f6eaf7a HEAD -- codex-rs/ext/goal/src/spec.rs
 
 `6bcccb0e` → 本参照提交之间上游挪动过位置的文件（diff 为空时先查这里）：
 
-| 原位置 | 现位置 |
-|---|---|
-| `core/src/session/turn.rs` — `auto_compact_token_status` | `core/src/session/context_window.rs` — `context_window_token_status` |
-| `core-skills/src/manager.rs` | `core-skills/src/service.rs` |
-| `core-skills/src/render.rs` — `### How to use skills` 段落 | `core/src/context/available_skills_instructions.rs` |
-| `state/auto_compact_window.rs` — `start_next` / `ordinal` | `advance` / `window_number` + `AutoCompactWindowIds` |
+| 原位置                                                     | 现位置                                                               |
+| ---------------------------------------------------------- | -------------------------------------------------------------------- |
+| `core/src/session/turn.rs` — `auto_compact_token_status`   | `core/src/session/context_window.rs` — `context_window_token_status` |
+| `core-skills/src/manager.rs`                               | `core-skills/src/service.rs`                                         |
+| `core-skills/src/render.rs` — `### How to use skills` 段落 | `core/src/context/available_skills_instructions.rs`                  |
+| `state/auto_compact_window.rs` — `start_next` / `ordinal`  | `advance` / `window_number` + `AutoCompactWindowIds`                 |
 
 **有意未照搬**的上游能力（纯 native、浏览器无对应实现）：`token_budget`
 提醒与 fallback prompt（feature 开关 + 配置层）、远端压缩
@@ -685,16 +717,24 @@ git diff 4f6eaf7a HEAD -- codex-rs/ext/goal/src/spec.rs
 `AutoCompactWindow.requestNewContextWindow()` 暴露）、以及 `ThreadStore` 新增的
 分页 / fork / model-context 接口。
 
+### 2026-09-13 同步说明
+
+已同步浏览器可用的子集：`request_user_input` 不再暴露/转发 `autoResolutionMs`；
+`update_goal` 支持用户明确要求的 `paused`；错误分类补充
+`rate_limit_exceeded` 与 `misalignment_policy_violation`；历史 token 估算改为按
+模型可见内容统计，不再序列化整个 envelope；协议事件补齐较新的上游字段。
+remote compaction、权限/批准、插件、realtime、app-server 等纯原生系统仍不在范围。
+
 ### 源码注释约定
 
 每个 `.ts` 文件都通过注释标明了与 codex-rs 的关系，同步上游时按此决定是否需要处理：
 
-| 注释 | 含义 | 上游有 diff 时的操作 |
-|---|---|---|
-| `// mirrors codex-rs/path/to/file.rs` | 直接照搬的 TypeScript 翻译 | **检查 diff**，大概率需要同步 |
-| `// mirrors: …`（行内） | 该字段/模式是特定 Rust 构造的 TS 等价物 | 确认对应的 Rust 构造是否变化 |
-| `// Browser-specific extension — no equivalent in codex-rs` | mirror 层之上新增的浏览器扩展，Rust 无对应实现 | **跳过**，上游变更不影响这里 |
-| `// Browser-specific adaptation of …` | 有意裁剪的适配（如 `Op.UserInput` vs `ThreadSettingsOverrides`） | 扫一眼 diff，看是否有值得补充的新字段 |
+| 注释                                                        | 含义                                                             | 上游有 diff 时的操作                  |
+| ----------------------------------------------------------- | ---------------------------------------------------------------- | ------------------------------------- |
+| `// mirrors codex-rs/path/to/file.rs`                       | 直接照搬的 TypeScript 翻译                                       | **检查 diff**，大概率需要同步         |
+| `// mirrors: …`（行内）                                     | 该字段/模式是特定 Rust 构造的 TS 等价物                          | 确认对应的 Rust 构造是否变化          |
+| `// Browser-specific extension — no equivalent in codex-rs` | mirror 层之上新增的浏览器扩展，Rust 无对应实现                   | **跳过**，上游变更不影响这里          |
+| `// Browser-specific adaptation of …`                       | 有意裁剪的适配（如 `Op.UserInput` vs `ThreadSettingsOverrides`） | 扫一眼 diff，看是否有值得补充的新字段 |
 
 ### 同步流程
 
@@ -711,23 +751,26 @@ git rebase upstream/main
 
 当上游 `codex-rs` 有变更时，按对应关系更新 `codex-ts` 的镜像文件：
 
-| 上游变更 | 需更新的 codex-ts 文件 |
-|---|---|
-| `protocol/src/protocol.rs` — 新增 EventMsg 变体 | `protocol/src/protocol.ts` |
-| `ext/goal/src/spec.rs` — schema 调整 | `ext/goal/src/spec.ts` |
-| `request_user_input_spec.rs` — 字段变更 | `core/src/tools/handlers/request_user_input_spec.ts` |
-| `plan_spec.rs` / `plan_tool.rs` — schema 变更 | `core/src/tools/handlers/plan_spec.ts` + `protocol/src/plan_tool.ts` |
-| `thread-store/src/store.rs` — 接口变更 | `thread-store/src/store.ts` |
-| `state/src/runtime/goals.rs` — accounting 逻辑变更 | `state/src/runtime/goals.ts` |
-| `compact.rs` — 压缩逻辑变更 | `core/src/compact.ts` |
-| `state/auto_compact_window.rs` — 压缩窗口变更 | `core/src/state/auto_compact_window.ts` |
-| `session/context_window.rs` — 压缩触发条件变更 | `core/src/session/turn.ts` 的 `autoCompactTokenStatus` |
-| `prompts/templates/compact/prompt.md` — 摘要 prompt | `core/src/compact.ts` 的 `SUMMARIZATION_PROMPT` |
-| `codex-api/src/sse/responses.rs` — SSE 事件 / 错误分类 | `core/src/session/turn.ts` + `core/src/session/retry.ts` |
-| `protocol/src/error.rs` — `CodexErrorInfo` / 可重试判定 | `protocol/src/protocol.ts` 的 `CodexErrorInfo` + `core/src/session/retry.ts` 的 `codexErrorInfoFor` |
-| `core-skills/src/render.rs` — catalog 文案 / 预算 | `core/src/skills.ts` |
-| `protocol/src/user_input.rs` + `models.rs` — 新增输入模态 | `protocol/src/user_input.ts` + `thread-store/src/types.ts` 的 `UserContentPart` |
-| 新增工具 | `core/src/tools/router.ts` |
+| 上游变更                                                     | 需更新的 codex-ts 文件                                                                              |
+| ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `protocol/src/protocol.rs` — 新增 EventMsg 变体              | `protocol/src/protocol.ts`                                                                          |
+| `ext/goal/src/spec.rs` — schema 调整                         | `ext/goal/src/spec.ts`                                                                              |
+| `request_user_input_spec.rs` — 字段变更                      | `core/src/tools/handlers/request_user_input_spec.ts`                                                |
+| `plan_spec.rs` / `plan_tool.rs` — schema 变更                | `core/src/tools/handlers/plan_spec.ts` + `protocol/src/plan_tool.ts`                                |
+| `thread-store/src/store.rs` — 接口变更                       | `thread-store/src/store.ts`                                                                         |
+| `state/src/runtime/goals.rs` — accounting 逻辑变更           | `state/src/runtime/goals.ts`                                                                        |
+| `compact.rs` — 压缩逻辑变更                                  | `core/src/compact.ts`                                                                               |
+| `state/auto_compact_window.rs` — 压缩窗口变更                | `core/src/state/auto_compact_window.ts`                                                             |
+| `session/context_window.rs` — 压缩触发条件变更               | `core/src/session/turn.ts` 的 `autoCompactTokenStatus`                                              |
+| `prompts/templates/compact/prompt.md` — 摘要 prompt          | `core/src/compact.ts` 的 `SUMMARIZATION_PROMPT`                                                     |
+| `codex-api/src/sse/responses.rs` — SSE 事件 / 错误分类       | `core/src/session/turn.ts` + `core/src/session/retry.ts`                                            |
+| `protocol/src/error.rs` — `CodexErrorInfo` / 可重试判定      | `protocol/src/protocol.ts` 的 `CodexErrorInfo` + `core/src/session/retry.ts` 的 `codexErrorInfoFor` |
+| `core-skills/src/render.rs` — catalog 文案 / 预算            | `core/src/skills.ts`                                                                                |
+| `protocol/src/user_input.rs` + `models.rs` — 新增输入模态    | `protocol/src/user_input.ts` + `thread-store/src/types.ts` 的 `UserContentPart`                     |
+| 新增工具                                                     | `core/src/tools/router.ts`                                                                          |
+| `tools/handlers/shell_spec.rs` — 命令 schema / approval 参数 | `host/src/exec/spec.ts` + `host/src/backend/types.ts`                                               |
+| `tools/sandboxing.rs` — approval / escalation policy         | `host/src/approvals/policy.ts`                                                                      |
+| `sandboxing/seatbelt.rs` + `windows-sandbox-rs`              | 留在宿主 backend；不要搬进 mirror 文件                                                              |
 
 ---
 
