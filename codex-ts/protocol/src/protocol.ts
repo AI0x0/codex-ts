@@ -313,6 +313,30 @@ export type Op =
       id: string;
       response: RequestUserInputResponse;
     }
+  | {
+      /**
+       * Inject a user-role message into the RUNNING turn without starting a new
+       * one. Mirrors codex-rs `Session::inject_no_new_turn` (core/src/session/
+       * inject.rs): with a task active the items join that turn's pending input
+       * and are drained into history before the next sampling round — after the
+       * tool outputs of the round that just finished (`run_turn` loop head,
+       * core/src/session/turn.rs); with no task active they are recorded into
+       * history right away, so the next turn carries them. Like the rs pending
+       * input, an injection that arrives during the model's final sampling round
+       * makes the turn sample once more (`needs_follow_up || has_pending_input`),
+       * and whatever is still pending when the turn ends is recorded then
+       * (`on_task_finished`, core/src/tasks/mod.rs).
+       *
+       * codex-rs exposes this only to extensions and hooks (it is not an Op —
+       * user steering goes through `Op::UserInput` on a running turn, which this
+       * port does not implement). It is a host-facing Op here because the host
+       * has the same need: a tool returns text, the picture that text refers to
+       * has to reach the model as a message, and the model should see both
+       * before it speaks again.
+       */
+      type: "InjectUserInput";
+      items: UserInput[];
+    }
   | { type: "Interrupt" };
 
 export type { RequestUserInputEvent, RequestUserInputResponse };

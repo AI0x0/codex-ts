@@ -18,6 +18,7 @@ import type {
   TurnStartedEvent,
 } from "../../protocol/src/protocol.js";
 import type { RequestUserInputResponse } from "../../protocol/src/request_user_input.js";
+import type { UserInput } from "../../protocol/src/user_input.js";
 import { GoalToolExecutor } from "../../ext/goal/src/tool.js";
 import { GoalStore, InMemoryGoalBackend } from "../../state/src/runtime/goals.js";
 import {
@@ -29,7 +30,7 @@ import type { ThreadStore, IoBackend } from "../../thread-store/src/index.js";
 import type { ConversationItem } from "../../thread-store/src/types.js";
 import { ToolRouter } from "./tools/router.js";
 import type { CustomTool } from "./tools/router.js";
-import { runTurn } from "./session/turn.js";
+import { runTurn, userMessagesOf } from "./session/turn.js";
 import { AutoCompactWindow } from "./state/auto_compact_window.js";
 import { SessionTokenState } from "./state/token_state.js";
 import { DEFAULT_BASE_INSTRUCTIONS } from "./base_instructions.js";
@@ -214,6 +215,14 @@ export class CodexThread {
     (response: RequestUserInputResponse) => void
   >();
 
+  /**
+   * Messages injected while a turn runs (Op::InjectUserInput), one group per
+   * submission. Drained by runTurn before every sampling round — mirrors the
+   * codex-rs turn pending input behind `Session::inject_if_running`
+   * (core/src/session/inject.rs).
+   */
+  private readonly pendingInjections: UserInput[][] = [];
+
   private readonly goalExecutor: GoalToolExecutor;
   private readonly router: ToolRouter;
   private readonly liveThread: LiveThread;
@@ -397,6 +406,7 @@ export class CodexThread {
           this.liveThread,        // ← persistence hook
           abortController.signal, // ← interrupt hook
           op.extraUserMessages,   // ← additional separate user messages (queue flush)
+          this.pendingInjections, // ← steering queue (Op::InjectUserInput)
         )
           .then(({ lastAgentMessage }) => {
             this.pushEvent(submissionId, {
@@ -464,6 +474,23 @@ export class CodexThread {
         if (resolve) {
           resolve(op.response);
           this.pendingInputs.delete(op.id);
+        }
+        break;
+      }
+
+      case "InjectUserInput": {
+        // Mirrors codex-rs `Session::inject_no_new_turn`: a running turn takes it
+        // as pending input, drained before its next sampling round (see runTurn);
+        // with no turn in flight it is recorded into history right away
+        // (`record_conversation_items`) so the next turn carries it.
+        if (this.currentTurnAbort) {
+          this.pendingInjections.push(op.items);
+          break;
+        }
+        const injected = userMessagesOf([op.items]);
+        if (injected.length > 0) {
+          this.history.push(...injected);
+          await this.liveThread.appendConversationItems(injected);
         }
         break;
       }

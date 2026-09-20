@@ -212,6 +212,34 @@ export interface TurnResult {
   events: EventMsg[];
 }
 
+/**
+ * UserInput groups → one role:user history item per group. Content mapping
+ * mirrors ResponseInputItem::from(Vec<UserInput>) (protocol/src/models.rs:1735):
+ * text → input_text, image → input_image { image_url } (detail default),
+ * audio → input_audio { audio_url }. Empty groups are dropped.
+ */
+export function userMessagesOf(groups: UserInput[][]): HistoryItem[] {
+  const toUserContent = (items: UserInput[]): UserContentPart[] =>
+    items
+      .map((item): UserContentPart | null => {
+        switch (item.type) {
+          case "text":
+            return { type: "input_text", text: item.text };
+          case "image":
+            return { type: "input_image", image_url: item.image_url };
+          case "audio":
+            return { type: "input_audio", audio_url: item.audio_url };
+          default:
+            return null;
+        }
+      })
+      .filter((part): part is UserContentPart => part !== null);
+  return groups
+    .map(toUserContent)
+    .filter((content) => content.length > 0)
+    .map((content) => ({ type: "message", role: "user", content }));
+}
+
 export async function runTurn(
   turnId: string,
   userItems: UserInput[],
@@ -231,33 +259,37 @@ export async function runTurn(
    *  app can flush a whole send-queue as one turn: "send all queued, not
    *  merged into one message"). */
   extraUserMessages?: UserInput[][] | undefined,
+  /** Messages injected while this turn runs (Op::InjectUserInput — mirrors the
+   *  codex-rs pending input behind `Session::inject_if_running`). The SHARED
+   *  queue owned by the thread: drained into history at the head of every
+   *  sampling round (rs: `get_pending_input` at the top of the `run_turn` loop),
+   *  i.e. after the tool outputs of the round that just finished, so a picture a
+   *  tool produced sits right behind that tool's text output. rs defers the
+   *  first drain until the turn's own input has been sampled
+   *  (`can_drain_pending_input = input.is_empty()`); here nothing can be pending
+   *  at turn start except a leftover from the previous turn's final instants,
+   *  which is drained first thing, ahead of this turn's own message. */
+  pendingInjections?: UserInput[][] | undefined,
 ): Promise<{ lastAgentMessage: string }> {
+  const drainInjections = async (): Promise<void> => {
+    if (!pendingInjections?.length) {
+      return;
+    }
+    const injected = userMessagesOf(pendingInjections.splice(0));
+    if (injected.length === 0) {
+      return;
+    }
+    history.push(...injected);
+    await liveThread?.appendConversationItems(injected);
+  };
+  await drainInjections();
+
   // Record one user message per submitted group, in order (mutates the shared
   // history array). codex-rs records each queued UserInput submission as its OWN
   // role:user item and never merges them; we mirror that by recording `userItems`
   // (the primary message) followed by each `extraUserMessages` entry as a separate
-  // message. Content mapping mirrors ResponseInputItem::from(Vec<UserInput>)
-  // (protocol/src/models.rs:1735): text → input_text, image → input_image
-  // { image_url } (detail default), audio → input_audio { audio_url }.
-  const toUserContent = (items: UserInput[]): UserContentPart[] =>
-    items
-      .map((item): UserContentPart | null => {
-        switch (item.type) {
-          case "text":
-            return { type: "input_text", text: item.text };
-          case "image":
-            return { type: "input_image", image_url: item.image_url };
-          case "audio":
-            return { type: "input_audio", audio_url: item.audio_url };
-          default:
-            return null;
-        }
-      })
-      .filter((part): part is UserContentPart => part !== null);
-  const userMsgs: HistoryItem[] = [userItems, ...(extraUserMessages ?? [])]
-    .map(toUserContent)
-    .filter((content) => content.length > 0)
-    .map((content) => ({ type: "message", role: "user", content }));
+  // message (content mapping in userMessagesOf).
+  const userMsgs = userMessagesOf([userItems, ...(extraUserMessages ?? [])]);
   history.push(...userMsgs);
   if (userMsgs.length > 0) {
     await liveThread?.appendConversationItems(userMsgs);
@@ -348,6 +380,11 @@ export async function runTurn(
     if (abortSignal?.aborted) {
       throw new DOMException("Turn interrupted", "AbortError");
     }
+
+    // ── Injected input: messages injected during the previous round land here,
+    // after that round's tool outputs and before the next request (mirrors the
+    // codex-rs `run_turn` loop head: pending input → run_hooks_and_record_inputs).
+    await drainInjections();
 
     // ── Pairing invariants before every request (mirrors for_prompt →
     // normalize_history): synthesize "aborted" outputs for calls that never
@@ -640,7 +677,10 @@ export async function runTurn(
     if (callItems.length > 0) await liveThread?.appendConversationItems(callItems);
 
     // ── Done when no tool calls ─────────────────────────────────────────────
-    if (functionCalls.length === 0) break;
+    // …unless something was injected while the model was producing that final
+    // message: then sample once more so it is seen (mirrors codex-rs
+    // `needs_follow_up = model_needs_follow_up || has_pending_input`).
+    if (functionCalls.length === 0 && !pendingInjections?.length) break;
 
     // ── Dispatch tool calls ─────────────────────────────────────────────────
     // Abort semantics (mirrors codex-rs, where the turn task is killed
@@ -729,5 +769,9 @@ export async function runTurn(
     }
   }
 
+  // Whatever was injected after the last sampling decision is recorded now, so
+  // it is in history for the next turn (mirrors codex-rs `on_task_finished`
+  // recording the turn's remaining pending input).
+  await drainInjections();
   return { lastAgentMessage };
 }
