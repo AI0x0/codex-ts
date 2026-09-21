@@ -20,7 +20,7 @@ export function createRequestUserInputTool(): ToolSpec {
 
   const optionsSchema = S.array(
     optionSchema,
-    'Provide 2-3 mutually exclusive choices. Put the recommended option first and suffix its label with "(Recommended)". ' +
+    'Provide 2-4 mutually exclusive choices. Put the recommended option first and suffix its label with "(Recommended)". ' +
       'Do not include an "Other" option; the client adds one automatically.',
   );
 

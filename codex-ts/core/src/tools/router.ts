@@ -74,24 +74,60 @@ export interface CustomTool {
   execute(args: unknown, ctx: CustomToolContext): Promise<string>;
 }
 
+// =============================================================================
+// Which built-ins are advertised — a host switch, no direct equivalent in codex-rs.
+//
+// codex-rs derives the built-in tool set from the session's config (sandbox
+// policy, approval mode, collaboration mode). codex-ts has none of those knobs,
+// so the host states it directly.
+// =============================================================================
+
+/**
+ * Which built-in tools to advertise to the model. Every flag defaults to true,
+ * so omitting this leaves the historical tool set unchanged.
+ *
+ * A registered tool costs its whole JSON schema in every request, and a host
+ * whose product has no use for goals or plans pays that on every turn for a
+ * tool the model must then be told not to call. Turning one off drops its spec
+ * (and, for `plan`, the matching paragraph of the base instructions).
+ *
+ * `request_user_input` has no flag: a turn that suspends on it is the only way
+ * a tool-calling agent can ask the user anything, so it is always registered.
+ */
+export interface BuiltinTools {
+  /** get_goal / create_goal / update_goal. Default true. */
+  goal?: boolean | undefined;
+  /** update_plan. Default true. */
+  plan?: boolean | undefined;
+}
+
 /** mirrors ToolRouter in router.rs */
 export class ToolRouter {
   private readonly goalExecutor: GoalToolExecutor;
   private readonly customTools: Map<string, CustomTool>;
+  private readonly builtins: Required<BuiltinTools>;
 
-  constructor(goalExecutor: GoalToolExecutor, customTools: CustomTool[] = []) {
+  constructor(
+    goalExecutor: GoalToolExecutor,
+    customTools: CustomTool[] = [],
+    builtins: BuiltinTools = {},
+  ) {
     this.goalExecutor = goalExecutor;
     this.customTools = new Map(customTools.map((tool) => [tool.name, tool]));
+    this.builtins = {
+      goal: builtins.goal ?? true,
+      plan: builtins.plan ?? true,
+    };
   }
 
   /** All tool specs to include in Responses API requests */
   toolSpecs(): ToolSpec[] {
     return [
-      createGetGoalTool(),
-      createCreateGoalTool(),
-      createUpdateGoalTool(),
+      ...(this.builtins.goal
+        ? [createGetGoalTool(), createCreateGoalTool(), createUpdateGoalTool()]
+        : []),
       createRequestUserInputTool(),
-      createUpdatePlanTool(),
+      ...(this.builtins.plan ? [createUpdatePlanTool()] : []),
       ...Array.from(this.customTools.values(), (tool) => tool.spec()),
     ];
   }
@@ -100,6 +136,11 @@ export class ToolRouter {
    * Dispatch a tool call; may suspend (request_user_input).
    * Side-effect events are emitted immediately via ctx.emitEvent rather than
    * returned, so RequestUserInput fires before the turn suspends.
+   *
+   * Every built-in stays dispatchable regardless of `builtins`: that flag
+   * governs what is ADVERTISED, and a thread resumed from a rollout written
+   * while the tool was on must still be able to answer a call already in its
+   * history. A model that was never handed the spec will not call it.
    */
   async dispatch(
     toolName: string,

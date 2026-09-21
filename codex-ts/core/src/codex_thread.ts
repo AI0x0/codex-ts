@@ -28,12 +28,12 @@ import {
 } from "../../thread-store/src/index.js";
 import type { ThreadStore, IoBackend } from "../../thread-store/src/index.js";
 import type { ConversationItem } from "../../thread-store/src/types.js";
-import { ToolRouter } from "./tools/router.js";
+import { ToolRouter, type BuiltinTools } from "./tools/router.js";
 import type { CustomTool } from "./tools/router.js";
 import { runTurn, userMessagesOf } from "./session/turn.js";
 import { AutoCompactWindow } from "./state/auto_compact_window.js";
 import { SessionTokenState } from "./state/token_state.js";
-import { DEFAULT_BASE_INSTRUCTIONS } from "./base_instructions.js";
+import { defaultBaseInstructions } from "./base_instructions.js";
 import { renderAvailableSkills } from "./skills.js";
 import type { SkillMetadata } from "./skills.js";
 import { codexErrorInfoFor, isAbortError } from "./session/retry.js";
@@ -123,10 +123,18 @@ export interface CodexThreadConfig {
    */
   customTools?: CustomTool[] | undefined;
   /**
+   * Which built-in tools to advertise (goal, plan). Every flag defaults to
+   * true, so omitting this keeps the historical tool set. Turning one off
+   * drops its spec from every request — and `plan: false` also drops the
+   * update_plan paragraph from the default base instructions, so the harness
+   * never names a tool the model was not given.
+   */
+  builtinTools?: BuiltinTools | undefined;
+  /**
    * Base agent instructions prepended ahead of `instructions`. Mirrors
    * codex-rs's base_instructions layer (the agent harness that keeps the model
-   * acting like a tool-calling agent). Defaults to DEFAULT_BASE_INSTRUCTIONS;
-   * pass "" to disable.
+   * acting like a tool-calling agent). Defaults to the harness for whichever
+   * built-ins `builtinTools` leaves on; pass "" to disable.
    */
   baseInstructions?: string | undefined;
   /**
@@ -243,13 +251,19 @@ export class CodexThread {
   private currentTurnAbort: AbortController | null = null;
 
   constructor(config: CodexThreadConfig) {
+    // Resolved first: the default harness text depends on which built-ins survive.
+    const builtins: Required<BuiltinTools> = {
+      goal: config.builtinTools?.goal ?? true,
+      plan: config.builtinTools?.plan ?? true,
+    };
     this.config = {
       apiKey: config.apiKey,
       baseUrl: config.baseUrl ?? "https://api.openai.com/v1",
       fetch: config.fetch ?? fetch,
       model: config.model,
       instructions: config.instructions,
-      baseInstructions: config.baseInstructions ?? DEFAULT_BASE_INSTRUCTIONS,
+      baseInstructions:
+        config.baseInstructions ?? defaultBaseInstructions({ plan: builtins.plan }),
       skills: config.skills ?? [],
       loadSkillContent: config.loadSkillContent,
       agentsMd: config.agentsMd,
@@ -274,7 +288,7 @@ export class CodexThread {
     const goalStore = config.goalStore ?? new GoalStore(new InMemoryGoalBackend());
     this.goalExecutor = new GoalToolExecutor(this.threadId, goalStore);
 
-    this.router = new ToolRouter(this.goalExecutor, config.customTools);
+    this.router = new ToolRouter(this.goalExecutor, config.customTools, builtins);
   }
 
   /** The thread's stable identifier (use for resume) */

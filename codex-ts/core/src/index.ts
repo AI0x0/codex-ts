@@ -25,7 +25,11 @@ export {
   removeOrphanOutputs,
 } from "./normalize.js";
 export type { CodexThreadConfig } from "./codex_thread.js";
-export { DEFAULT_BASE_INSTRUCTIONS } from "./base_instructions.js";
+export {
+  DEFAULT_BASE_INSTRUCTIONS,
+  defaultBaseInstructions,
+} from "./base_instructions.js";
+export type { BaseInstructionsOptions } from "./base_instructions.js";
 export {
   renderAvailableSkills,
   renderSkillsCatalog,
@@ -42,6 +46,7 @@ export type {
 } from "./skills.js";
 export { ToolRouter } from "./tools/router.js";
 export type {
+  BuiltinTools,
   CustomTool,
   CustomToolContext,
   ToolRouterContext,

@@ -8,6 +8,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CodexThread } from "../../src/codex_thread.js";
+import type { CodexThreadConfig } from "../../src/codex_thread.js";
 import { DEFAULT_BASE_INSTRUCTIONS } from "../../src/base_instructions.js";
 import type { CustomTool } from "../../src/tools/router.js";
 import {
@@ -248,5 +249,72 @@ describe("baseInstructions layering", () => {
     expect(instr).toContain("per-turn override");
     expect(instr).not.toContain("thread-level");
     expect(instr).toContain(DEFAULT_BASE_INSTRUCTIONS.slice(0, 20));
+  });
+});
+
+// A tool spec's name, whatever shape it takes.
+function capturedToolNames(fetchMock: ReturnType<typeof vi.fn>): string[] {
+  const init = fetchMock.mock.calls[0]![1] as RequestInit;
+  const body = JSON.parse(init.body as string) as {
+    tools?: { name?: string; function?: { name?: string } }[];
+  };
+  return (body.tools ?? []).map(
+    (tool) => tool.name ?? tool.function?.name ?? "",
+  );
+}
+
+async function toolNamesFor(
+  builtinTools: CodexThreadConfig["builtinTools"],
+): Promise<{ instructions: string; tools: string[] }> {
+  const fetchMock = vi.fn().mockResolvedValue(makeSimpleResponse());
+  vi.stubGlobal("fetch", fetchMock);
+  const codex = new CodexThread({
+    apiKey: "k",
+    model: "m",
+    ...(builtinTools ? { builtinTools } : {}),
+  });
+  await codex.submit({
+    type: "UserInput",
+    items: [{ type: "text", text: "hi" }],
+  });
+  await waitForEvent(codex, (m) => m.type === "TurnComplete");
+  return {
+    instructions: capturedInstructions(fetchMock),
+    tools: capturedToolNames(fetchMock),
+  };
+}
+
+describe("builtinTools", () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("advertises every built-in by default", async () => {
+    const { tools } = await toolNamesFor(undefined);
+    expect(tools).toEqual([
+      "get_goal",
+      "create_goal",
+      "update_goal",
+      "request_user_input",
+      "update_plan",
+    ]);
+  });
+
+  it("goal: false drops the three goal tools", async () => {
+    const { tools } = await toolNamesFor({ goal: false });
+    expect(tools).toEqual(["request_user_input", "update_plan"]);
+  });
+
+  it("plan: false drops update_plan and stops the harness naming it", async () => {
+    const { instructions, tools } = await toolNamesFor({ plan: false });
+    expect(tools).not.toContain("update_plan");
+    expect(instructions).not.toContain("update_plan");
+    // The rest of the harness is untouched.
+    expect(instructions).toContain("You are an autonomous agent");
+  });
+
+  it("keeps request_user_input whatever the flags say", async () => {
+    const { tools } = await toolNamesFor({ goal: false, plan: false });
+    expect(tools).toEqual(["request_user_input"]);
   });
 });
