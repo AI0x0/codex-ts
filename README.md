@@ -2,7 +2,7 @@
 
 A lightweight TypeScript agent harness that mirrors the architecture of [openai/codex](https://github.com/openai/codex) (`codex-rs`) — runs in the **browser** and **Node.js** with zero native dependencies.
 
-Forked from [`openai/codex@a592c38c`](https://github.com/openai/codex/commit/a592c38cf). All new code lives in `codex-ts/`; upstream files are untouched.
+Forked from [`openai/codex@89461ea6`](https://github.com/openai/codex/commit/89461ea6833832b0551ce24ee32205824d5c108d). All new code lives in `codex-ts/`; upstream files are untouched.
 
 [中文文档](./README.zh.md)
 
@@ -614,7 +614,11 @@ const thread = new CodexThread({
 ```
 
 `CustomToolContext` exposes `callId`, `turnId`, and `emitEvent` for tools that
-need to emit side-effect events (e.g. streaming progress) before returning.
+need to emit side-effect events (e.g. streaming progress) before returning, plus
+`signal` — the turn's interrupt. On `Interrupt` the turn stops waiting for the
+call at once and drops its result (mirrors the cancellation token codex-rs hands
+every tool handler), so a tool should stop its own work there: close a pending
+confirmation, cancel a request, skip a step that would spend money.
 
 For project-internal tools that should be part of the built-in set, add a `case`
 in `core/src/tools/router.ts` instead (same pattern as `update_plan`).
@@ -698,28 +702,32 @@ Only `codex-ts/` is added; the single upstream file change is one line appended 
 
 All implementations in `codex-ts/` were written against codex-rs at:
 
-**[`a592c38c`](https://github.com/openai/codex/commit/a592c38cf) — Use OpenSSL 3.6.4 for musl builds (#45149)**
+**[`89461ea6`](https://github.com/openai/codex/commit/89461ea6833832b0551ce24ee32205824d5c108d) — Prune unused standalone releases after successful installation (#55149)**
 
-When syncing, diff from this hash to find what changed in the Rust source and update the corresponding `.ts` file:
+When syncing, diff from this hash to find what changed in the Rust source and update the corresponding `.ts` file. The fork does not merge upstream history, so diff against the fetched `upstream/main`:
 
 ```bash
 # Check what changed in mirrored files
-git diff a592c38c HEAD -- codex-rs/protocol/src/protocol.rs
-git diff a592c38c HEAD -- codex-rs/ext/goal/src/spec.rs
+git diff 89461ea6 upstream/main -- codex-rs/protocol/src/protocol.rs
+git diff 89461ea6 upstream/main -- codex-rs/ext/goal/src/spec.rs
 # repeat for each file in the mapping table below
 ```
 
 Update the hash above to the new reference commit after each sync.
 
-Upstream files that moved between `6bcccb0e` and this commit (useful when a diff
-comes back empty):
+Upstream files that moved since `6bcccb0e` (useful when a diff comes back
+empty):
 
 | Was                                                           | Now                                                                  |
 | ------------------------------------------------------------- | -------------------------------------------------------------------- |
 | `core/src/session/turn.rs` — `auto_compact_token_status`      | `core/src/session/context_window.rs` — `context_window_token_status` |
 | `core-skills/src/manager.rs`                                  | `core-skills/src/service.rs`                                         |
-| `core-skills/src/render.rs` — `### How to use skills` section | `core/src/context/available_skills_instructions.rs`                  |
+| `core-skills/src/render.rs` — `### How to use skills` section | `ext/skills/src/fragments.rs` — `AvailableSkillsInstructions`        |
+| `core-skills/src/render.rs` — catalog lines / budget          | `ext/skills/src/render.rs`                                           |
+| `core-skills/src/injection.rs` — `$skill` mentions            | `skills/src/mentions.rs`                                             |
 | `state/auto_compact_window.rs` — `start_next` / `ordinal`     | `advance` / `window_number` + `AutoCompactWindowIds`                 |
+| `core/src/util.rs` — `backoff`                                | `async-utils/src/backoff.rs`                                         |
+| `codex-api/src/sse/responses.rs` — `response.failed` parsing  | `codex-api/src/sse/responses_error.rs` — `parse_failed_response`     |
 
 Deliberately **not** ported (native-only upstream features with no browser
 counterpart): `token_budget` reminders/fallback prompts (feature-gated config),
@@ -739,6 +747,48 @@ envelopes; and protocol event shapes add newer upstream fields. Native-only
 systems around remote compaction, permissions/approvals, plugins, realtime,
 and app-server APIs remain out of scope.
 
+### 2026-10-19 sync notes
+
+Re-checked every mirrored file against `89461ea6` (1652 upstream commits since
+`a592c38c`) and ported the browser-relevant changes:
+
+- **An interrupt no longer waits for a running tool.** codex-rs races every tool
+  call against the turn's cancellation token (`core/src/tools/parallel.rs`);
+  codex-ts awaited the dispatch, so `TurnAborted` only came once the tool
+  returned — a confirmation nobody answered kept the turn alive. The dispatch
+  now stops waiting on Interrupt (an unanswered `request_user_input` included),
+  custom tools get the interrupt as `ctx.signal`, and inline compaction honors it.
+- **Responses failures** (`sse/responses_error.rs`, `api_bridge.rs`,
+  `CodexErr::retry_delay`): a Retry-After inside a failed event's
+  `response.error.headers`; more out-of-credit codes; `bio_policy`,
+  `invalid_prompt` and `flex_unavailable` get their own `CodexErrorInfo`;
+  `slow_down` is a retryable rate limit; `server_is_overloaded` retries only on
+  server advice; other HTTP statuses classify as `http_connection_failed`; server
+  advice is a deadline counted from the response.
+- **`response.incomplete`** is terminal (#53451) except for a content filter,
+  whose retry carries recovery guidance (#49119); its usage is still reported
+  without replacing the context baseline (#53670); `reason: "interrupted"` —
+  like `end_turn: false` on `response.completed` — samples again.
+- **Compaction** only takes a summary from a completed response (#53932), keeps
+  retained text-only user messages part for part (#48115), and truncates head +
+  tail.
+- **Skills**: the "descriptions were shortened" warning is gone.
+- **Protocol**: `root_turn_id` on `TurnComplete` / `TurnAborted`,
+  `TurnAborted.error`, the new `CodexErrorInfo` variants.
+- **Inject**: input injected while a turn finishes is recorded once it ends
+  (#53452).
+
+Browser-specific adaptations: the content-filter guidance is turn-scoped and sent
+as a marked user message (codex-rs records a developer message); media-only user
+messages are left out of the compacted history (some providers reject an empty
+text part); a plain HTTP 429 / 5xx stays retryable (codex-rs retries those in
+its HTTP client before the turn loop sees them).
+
+Not ported (native-only or opt-in upstream): `instant_interrupt` preemption,
+post-turn / background / remote compaction, `InterruptIfNoPendingInput`,
+Guardian, multi-agent mail, executor / cloud skill catalogs, thread-store
+pagination and lineage, file-referenced images.
+
 ### Source comment conventions
 
 Every `.ts` file that has a non-trivial relationship with codex-rs is annotated
@@ -753,26 +803,26 @@ so you know at a glance whether a diff from upstream requires action:
 
 ### File mapping
 
-| Upstream change                                                     | codex-ts file to update                                                                             |
-| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `protocol/src/protocol.rs` — new EventMsg variant                   | `protocol/src/protocol.ts`                                                                          |
-| `ext/goal/src/spec.rs` — schema change                              | `ext/goal/src/spec.ts`                                                                              |
-| `request_user_input_spec.rs` — field change                         | `core/src/tools/handlers/request_user_input_spec.ts`                                                |
-| `plan_spec.rs` / `plan_tool.rs` — schema change                     | `core/src/tools/handlers/plan_spec.ts` + `protocol/src/plan_tool.ts`                                |
-| `thread-store/src/store.rs` — interface change                      | `thread-store/src/store.ts`                                                                         |
-| `state/src/runtime/goals.rs` — accounting change                    | `state/src/runtime/goals.ts`                                                                        |
-| `compact.rs` — compaction logic change                              | `core/src/compact.ts`                                                                               |
-| `state/auto_compact_window.rs` — window tracking change             | `core/src/state/auto_compact_window.ts`                                                             |
-| `session/context_window.rs` — compaction trigger change             | `autoCompactTokenStatus` in `core/src/session/turn.ts`                                              |
-| `prompts/templates/compact/prompt.md` — summarisation prompt        | `SUMMARIZATION_PROMPT` in `core/src/compact.ts`                                                     |
-| `codex-api/src/sse/responses.rs` — SSE event / error classification | `core/src/session/turn.ts` + `core/src/session/retry.ts`                                            |
-| `protocol/src/error.rs` — `CodexErrorInfo` / retryability           | `CodexErrorInfo` in `protocol/src/protocol.ts` + `codexErrorInfoFor` in `core/src/session/retry.ts` |
-| `core-skills/src/render.rs` — catalog text / budget                 | `core/src/skills.ts`                                                                                |
-| `protocol/src/user_input.rs` + `models.rs` — new input modality     | `protocol/src/user_input.ts` + `UserContentPart` in `thread-store/src/types.ts`                     |
-| New tool added                                                      | `core/src/tools/router.ts`                                                                          |
-| `tools/handlers/shell_spec.rs` — command schema/approval parameters | `host/src/exec/spec.ts` + `host/src/backend/types.ts`                                               |
-| `tools/sandboxing.rs` — approval / escalation policy                | `host/src/approvals/policy.ts`                                                                      |
-| `sandboxing/seatbelt.rs` + `windows-sandbox-rs`                     | stays in the embedding host backend; do not port into mirror files                                  |
+| Upstream change                                                                            | codex-ts file to update                                                                             |
+| ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `protocol/src/protocol.rs` — new EventMsg variant                                          | `protocol/src/protocol.ts`                                                                          |
+| `ext/goal/src/spec.rs` — schema change                                                     | `ext/goal/src/spec.ts`                                                                              |
+| `request_user_input_spec.rs` — field change                                                | `core/src/tools/handlers/request_user_input_spec.ts`                                                |
+| `plan_spec.rs` / `plan_tool.rs` — schema change                                            | `core/src/tools/handlers/plan_spec.ts` + `protocol/src/plan_tool.ts`                                |
+| `thread-store/src/store.rs` — interface change                                             | `thread-store/src/store.ts`                                                                         |
+| `state/src/runtime/goals.rs` — accounting change                                           | `state/src/runtime/goals.ts`                                                                        |
+| `compact.rs` — compaction logic change                                                     | `core/src/compact.ts`                                                                               |
+| `state/auto_compact_window.rs` — window tracking change                                    | `core/src/state/auto_compact_window.ts`                                                             |
+| `session/context_window.rs` — compaction trigger change                                    | `autoCompactTokenStatus` in `core/src/session/turn.ts`                                              |
+| `prompts/templates/compact/prompt.md` — summarisation prompt                               | `SUMMARIZATION_PROMPT` in `core/src/compact.ts`                                                     |
+| `codex-api/src/sse/responses.rs` + `responses_error.rs` — SSE event / error classification | `core/src/session/turn.ts` + `core/src/session/retry.ts`                                            |
+| `protocol/src/error.rs` — `CodexErrorInfo` / retryability                                  | `CodexErrorInfo` in `protocol/src/protocol.ts` + `codexErrorInfoFor` in `core/src/session/retry.ts` |
+| `ext/skills/src/render.rs` + `fragments.rs` — catalog text / budget                        | `core/src/skills.ts`                                                                                |
+| `protocol/src/user_input.rs` + `models.rs` — new input modality                            | `protocol/src/user_input.ts` + `UserContentPart` in `thread-store/src/types.ts`                     |
+| New tool added                                                                             | `core/src/tools/router.ts`                                                                          |
+| `tools/handlers/shell_spec.rs` — command schema/approval parameters                        | `host/src/exec/spec.ts` + `host/src/backend/types.ts`                                               |
+| `tools/sandboxing.rs` — approval / escalation policy                                       | `host/src/approvals/policy.ts`                                                                      |
+| `sandboxing/seatbelt.rs` + `windows-sandbox-rs`                                            | stays in the embedding host backend; do not port into mirror files                                  |
 
 ### Sync workflow
 
@@ -780,11 +830,10 @@ so you know at a glance whether a diff from upstream requires action:
 # Add upstream remote (first time only)
 git remote add upstream git@github.com:openai/codex.git
 
-# Fetch and rebase
-git fetch upstream
-git rebase upstream/main
-
-# The only conflict will be pnpm-workspace.yaml — keep the codex-ts line
+# Fetch, then port: diff each mirrored file from the reference commit above to
+# upstream/main, update the matching .ts file, and record the new reference.
+git fetch upstream main --no-tags
+git diff <reference> upstream/main -- codex-rs/core/src/session/turn.rs
 ```
 
 ---

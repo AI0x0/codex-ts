@@ -426,6 +426,8 @@ export class CodexThread {
             this.pushEvent(submissionId, {
               type: "TurnComplete",
               event: {
+                // Every codex-ts turn is its own causal root (no sub-agents).
+                root_turn_id: turnId,
                 turn_id: turnId,
                 last_agent_message: lastAgentMessage || undefined,
                 started_at: startedAt,
@@ -448,9 +450,14 @@ export class CodexThread {
             // mirrors tasks/mod.rs:785-794: an ABORTED turn terminates with
             // TurnAborted, never TurnComplete.
             if (isAbortError(err)) {
+              // A question this turn was still waiting on goes with it: the
+              // turn stopped waiting the moment it was interrupted (see the
+              // dispatch loop in runTurn), so a late answer has nowhere to go.
+              this.pendingInputs.delete(turnId);
               this.pushEvent(submissionId, {
                 type: "TurnAborted",
                 event: {
+                  root_turn_id: turnId,
                   turn_id: turnId,
                   reason: "interrupted",
                   started_at: startedAt,
@@ -467,6 +474,7 @@ export class CodexThread {
             this.pushEvent(submissionId, {
               type: "TurnComplete",
               event: {
+                root_turn_id: turnId,
                 turn_id: turnId,
                 error,
                 started_at: startedAt,
@@ -476,9 +484,16 @@ export class CodexThread {
             });
           })
           .finally(() => {
-            if (this.currentTurnAbort === abortController) {
-              this.currentTurnAbort = null;
+            if (this.currentTurnAbort !== abortController) {
+              return;
             }
+            this.currentTurnAbort = null;
+            // Input injected after the turn's last drain — while it was emitting
+            // its terminal event — is recorded now instead of waiting for the
+            // next turn. mirrors codex-rs closing input admission while a turn
+            // finishes recording (inject.rs, #53452): such input is no longer
+            // handed to the finishing turn but recorded once it is done.
+            void this.recordLeftoverInjections();
           });
         break;
       }
@@ -515,6 +530,22 @@ export class CodexThread {
     }
 
     return submissionId;
+  }
+
+  /**
+   * Record injected input that no turn will drain (see the turn's `finally`).
+   * A turn that starts in the meantime drains the queue itself (runTurn takes
+   * it with splice), so nothing is recorded twice.
+   */
+  private async recordLeftoverInjections(): Promise<void> {
+    if (this.currentTurnAbort || this.pendingInjections.length === 0) {
+      return;
+    }
+    const injected = userMessagesOf(this.pendingInjections.splice(0));
+    if (injected.length > 0) {
+      this.history.push(...injected);
+      await this.liveThread.appendConversationItems(injected);
+    }
   }
 
   /**

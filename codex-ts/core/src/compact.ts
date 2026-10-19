@@ -11,17 +11,19 @@ import type { ConversationItem } from "../../thread-store/src/types.js";
 import type { TurnConfig } from "./session/turn.js";
 import { parseSseStream } from "./session/sse.js";
 import {
+  classifyHttpFailure,
   classifyStreamFailure,
-  computeRetryDelay,
   DEFAULT_MAX_RETRIES,
   isContextWindowExceededError,
-  isRetryableError,
-  parseRetryAfter,
   ResponsesApiError,
+  retryDelayFor,
   sleep,
 } from "./session/retry.js";
 import { normalizeHistory, removeCorrespondingFor } from "./normalize.js";
-import { estimateItemsTokenCount } from "./state/token_state.js";
+import {
+  approxTokenCount,
+  estimateItemsTokenCount,
+} from "./state/token_state.js";
 
 // ─── Prompt constants (verbatim from codex-rs templates) ──────────────────────
 
@@ -47,51 +49,130 @@ export const SUMMARY_PREFIX =
 /** mirrors COMPACT_USER_MESSAGE_MAX_TOKENS in compact.rs */
 const COMPACT_USER_MESSAGE_MAX_TOKENS = 20_000;
 
-// ─── Token approximation (mirrors codex-rs/utils/output-truncation) ───────────
+// ─── Token approximation (mirrors codex-rs/utils/string/src/truncate.rs) ──────
+// codex-rs budgets in UTF-8 bytes (4 per token); codex-ts's estimate counts
+// UTF-16 units (see state/token_state approxTokenCount), so the same algorithm
+// runs on string length here.
 
-/** ~4 chars per token — cheap approximation, good enough for budget checks */
-function approxTokenCount(text: string): number {
-  return Math.ceil(text.length / 4);
+const APPROX_CHARS_PER_TOKEN = 4;
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff;
 }
 
-function truncateToTokens(text: string, maxTokens: number): string {
-  const maxChars = maxTokens * 4;
-  return text.length <= maxChars ? text : text.slice(0, maxChars);
+/**
+ * Middle truncation of one message's text parts to `maxTokens`.
+ *
+ * mirrors truncate_annotated_text (context-fragments/src/annotated_content.rs)
+ * over plan_token_truncation (utils/string/src/truncate.rs): the combined text
+ * keeps its head and tail halves, the middle is cut, and a
+ * "…N tokens truncated…" marker sits where the cut is — part boundaries
+ * survive (a part straddling the cut keeps its head / tail slice). A cut never
+ * splits a surrogate pair (rs: floor/ceil_char_boundary).
+ */
+function truncateTextParts(parts: string[], maxTokens: number): string[] {
+  const total = parts.join("");
+  const maxChars = maxTokens * APPROX_CHARS_PER_TOKEN;
+  if (total.length <= maxChars) {
+    return parts;
+  }
+  const leftBudget = Math.floor(maxChars / 2);
+  const rightBudget = maxChars - leftBudget;
+  let removedStart = leftBudget;
+  let removedEnd = total.length - rightBudget;
+  if (removedStart > 0 && isLowSurrogate(total.charCodeAt(removedStart))) {
+    removedStart -= 1;
+  }
+  if (removedEnd < total.length && isLowSurrogate(total.charCodeAt(removedEnd))) {
+    removedEnd += 1;
+  }
+  const removedTokens = Math.ceil(
+    (total.length - maxChars) / APPROX_CHARS_PER_TOKEN,
+  );
+  let notice: string | undefined = `…${removedTokens} tokens truncated…`;
+  const result: string[] = [];
+  let offset = 0;
+  for (const text of parts) {
+    const start = offset;
+    offset += text.length;
+    if (offset <= removedStart || start >= removedEnd) {
+      result.push(text);
+      continue;
+    }
+    const prefixEnd = Math.max(0, removedStart - start);
+    const suffixStart = Math.min(text.length, Math.max(0, removedEnd - start));
+    if (prefixEnd > 0) {
+      result.push(text.slice(0, prefixEnd));
+    }
+    if (notice !== undefined) {
+      result.push(notice);
+      notice = undefined;
+    }
+    if (suffixStart < text.length) {
+      result.push(text.slice(suffixStart));
+    }
+  }
+  return result;
 }
 
 // ─── History helpers ─────────────────────────────────────────────────────────
 
+type UserMessageItem = Extract<ConversationItem, { role: "user" }>;
+
+/**
+ * One user message collected for the replacement history.
+ * mirrors CompactedUserMessage (compact.rs): the flattened text only drives the
+ * token budget and the truncation fallback; a whole text-only message that
+ * fits is kept exactly as it was (codex-rs #48115).
+ */
+export interface CompactedUserMessage {
+  /** The message's text parts joined by "\n". */
+  message: string;
+  /** The message as it sits in history. */
+  original: UserMessageItem;
+}
+
 /**
  * True when a user message is itself a previous compaction summary.
- * mirrors is_summary_message (compact.rs:550).
+ * mirrors is_summary_message (compact.rs).
  */
 export function isSummaryMessage(message: string): boolean {
   return message.startsWith(`${SUMMARY_PREFIX}\n`);
 }
 
+function textPartsOf(item: UserMessageItem): string[] {
+  if (typeof item.content === "string") {
+    return [item.content];
+  }
+  return item.content
+    .filter(
+      (part): part is { type: "input_text"; text: string } =>
+        part.type === "input_text",
+    )
+    .map((part) => part.text);
+}
+
 /**
- * Extract plain-text content from all user messages in history, skipping
- * previous compaction summaries.
- * mirrors collect_user_messages (compact.rs:525): a message that starts with
+ * The user messages in history, skipping previous compaction summaries.
+ * mirrors collect_user_messages (compact.rs): a message that starts with
  * SUMMARY_PREFIX is dropped, so a second compaction does not re-collect the
  * first summary as a "user message" and stack summaries on top of each other.
  * Note the summary produced by THIS compaction is appended separately by
  * buildCompactedHistory.
+ *
+ * Browser-specific adaptation: a media-only message (no text at all) is left
+ * out. codex-rs keeps it as an empty text part, but an empty text block is
+ * rejected outright by some providers behind a Responses proxy (Anthropic).
  */
-export function collectUserMessages(history: ConversationItem[]): string[] {
-  const messages: string[] = [];
+export function collectUserMessages(
+  history: ConversationItem[],
+): CompactedUserMessage[] {
+  const messages: CompactedUserMessage[] = [];
   for (const item of history) {
-    if (!("role" in item) || item.role !== "user") continue;
-    if (typeof item.content === "string") {
-      if (item.content && !isSummaryMessage(item.content)) {
-        messages.push(item.content);
-      }
-    } else if (Array.isArray(item.content)) {
-      const text = item.content
-        .filter((p): p is { type: "input_text"; text: string } => p.type === "input_text")
-        .map((p) => p.text)
-        .join("\n");
-      if (text && !isSummaryMessage(text)) messages.push(text);
+    if (item.type !== "message" || item.role !== "user") continue;
+    const message = textPartsOf(item).join("\n");
+    if (message && !isSummaryMessage(message)) {
+      messages.push({ message, original: item });
     }
   }
   return messages;
@@ -99,48 +180,51 @@ export function collectUserMessages(history: ConversationItem[]): string[] {
 
 /**
  * Build the replacement history from recent user messages + summary.
- * mirrors build_compacted_history_with_limit in compact.rs:
- *   - Walk user messages in reverse, filling up to COMPACT_USER_MESSAGE_MAX_TOKENS
- *   - Append the summary as the final user message
+ * mirrors build_compacted_history_with_limit (compact.rs):
+ *   - walk user messages newest first, filling up to
+ *     COMPACT_USER_MESSAGE_MAX_TOKENS;
+ *   - a text-only message that fits is kept verbatim — its content parts and
+ *     boundaries survive (#48115); otherwise it is rebuilt from its text parts
+ *     only (images / audio are not carried over), middle-truncated to what is
+ *     left of the budget, and the walk stops there;
+ *   - the summary goes last, as a user message.
  */
 export function buildCompactedHistory(
-  userMessages: string[],
+  userMessages: CompactedUserMessage[],
   summaryText: string,
 ): ConversationItem[] {
-  const maxTokens = COMPACT_USER_MESSAGE_MAX_TOKENS;
-  let remaining = maxTokens;
-  const selected: string[] = [];
-
-  for (let i = userMessages.length - 1; i >= 0; i--) {
-    if (remaining === 0) break;
-    const msg = userMessages[i]!;
-    const tokens = approxTokenCount(msg);
-    if (tokens <= remaining) {
-      selected.unshift(msg);
-      remaining -= tokens;
+  let remaining = COMPACT_USER_MESSAGE_MAX_TOKENS;
+  const selected: ConversationItem[] = [];
+  for (let i = userMessages.length - 1; i >= 0 && remaining > 0; i -= 1) {
+    const { message, original } = userMessages[i]!;
+    const tokens = approxTokenCount(message);
+    const textOnly =
+      typeof original.content === "string" ||
+      original.content.every((part) => part.type === "input_text");
+    if (tokens <= remaining && textOnly) {
+      selected.push(original);
     } else {
-      selected.unshift(truncateToTokens(msg, remaining));
+      const parts = truncateTextParts(textPartsOf(original), remaining)
+        // An empty text block is rejected by some providers (see
+        // collectUserMessages); the marker and the slices are never empty.
+        .filter((text) => text.length > 0)
+        .map((text) => ({ type: "input_text" as const, text }));
+      selected.push({ type: "message", role: "user", content: parts });
+    }
+    if (tokens > remaining) {
       break;
     }
+    remaining -= tokens;
   }
-
-  const history: ConversationItem[] = [];
-  for (const text of selected) {
-    history.push({
-      type: "message",
-      role: "user",
-      content: [{ type: "input_text", text }],
-    });
-  }
+  selected.reverse();
 
   const finalSummary = summaryText || "(no summary available)";
-  history.push({
+  selected.push({
     type: "message",
     role: "user",
     content: [{ type: "input_text", text: finalSummary }],
   });
-
-  return history;
+  return selected;
 }
 
 // ─── Compaction request ───────────────────────────────────────────────────────
@@ -148,15 +232,19 @@ export function buildCompactedHistory(
 /**
  * Run an inline compaction turn:
  *   1. Send SUMMARIZATION_PROMPT + current history to the model
- *   2. Collect the assistant's summary text
+ *   2. Collect the assistant's summary text — only once the response COMPLETES
  *   3. Build replacement history and mutate `history` in-place
  *
  * mirrors run_inline_auto_compact_task + run_compact_task_inner_impl in compact.rs
  * Returns the raw summary text (without SUMMARY_PREFIX).
+ *
+ * `signal` is the turn's interrupt hook: an interrupt aborts the summarizer
+ * request and any backoff, leaving history untouched.
  */
 export async function runInlineAutoCompactTask(
   history: ConversationItem[],
   config: TurnConfig,
+  signal?: AbortSignal | undefined,
 ): Promise<string> {
   // Working copy sent to the summarizer. When the compaction request ITSELF
   // exceeds the context window, drop the OLDEST item and retry (mirrors
@@ -199,34 +287,60 @@ export async function runInlineAutoCompactTask(
           Authorization: `Bearer ${config.apiKey}`,
         },
         body: JSON.stringify(body),
+        signal: signal ?? null,
       });
 
       if (!res.ok || !res.body) {
         const text = res.body ? await res.text() : "(no body)";
-        throw new ResponsesApiError(
-          res.status,
-          text,
-          parseRetryAfter(res.headers),
-        );
+        throw classifyHttpFailure(res.status, text, res.headers);
       }
 
-      // Collect the assistant's summary text from the stream
-      summaryText = "";
+      // Buffer the summary until `response.completed` (mirrors
+      // drain_to_completed, compact.rs; codex-rs #53932): a stream that drops,
+      // fails or comes back incomplete must leave NO partial summary behind —
+      // history is only replaced from a completed response.
+      let streamed = "";
+      let completed = false;
       for await (const raw of parseSseStream(res.body)) {
-        if (raw["type"] === "response.output_text.delta") {
-          summaryText += String(raw["delta"] ?? "");
-        } else if (
-          raw["type"] === "response.failed" ||
-          raw["type"] === "response.incomplete"
-        ) {
-          // Terminal stream event — same classification as the turn loop
-          // (context-window-exceeded → trim; quota/policy failures → terminal;
-          // otherwise retryable). mirrors process_responses_event.
-          throw classifyStreamFailure(raw);
+        switch (raw["type"]) {
+          case "response.output_text.delta":
+            streamed += String(raw["delta"] ?? "");
+            break;
+          case "response.completed":
+            completed = true;
+            break;
+          case "response.failed":
+          case "response.incomplete":
+            // Same classification as the turn loop (context-window-exceeded →
+            // trim; quota / policy / incomplete → terminal; otherwise
+            // retryable). mirrors process_responses_event.
+            throw classifyStreamFailure(raw);
+          case "error": {
+            const error = raw["error"] as Record<string, unknown> | undefined;
+            if (error?.["code"] === "flex_unavailable") {
+              throw classifyStreamFailure(raw);
+            }
+            break;
+          }
         }
+        if (completed) break;
       }
+      if (!completed) {
+        // mirrors the "stream closed before response.completed" stream error
+        // (codex-api/src/sse/responses.rs) — retryable.
+        throw new ResponsesApiError(
+          503,
+          "stream closed before response.completed",
+          undefined,
+          false,
+          { kind: "stream" },
+        );
+      }
+      summaryText = streamed;
       break; // summary collected → leave the retry loop
     } catch (err) {
+      // An interrupt is terminal — never retry past a cancellation.
+      if (signal?.aborted) throw err;
       if (isContextWindowExceededError(err)) {
         if (summarizerInput.length > 1) {
           // mirrors compact.rs:233-240 + history.remove_first_item: drop the
@@ -269,13 +383,16 @@ export async function runInlineAutoCompactTask(
         config.tokenState?.setFull(config.contextWindow);
         throw err;
       }
-      // Transient failures back off and retry (mirrors compact.rs:248-259).
-      if (retries < maxRetries && isRetryableError(err)) {
-        retries += 1;
-        await sleep(computeRetryDelay(err, retries));
-        continue;
+      // Transient failures back off and retry (mirrors compact.rs:248-259);
+      // a terminal one — an incomplete response included (#53451) — surfaces
+      // at once, leaving history untouched.
+      const delay =
+        retries < maxRetries ? retryDelayFor(err, retries + 1) : undefined;
+      if (delay === undefined) {
+        throw err;
       }
-      throw err;
+      retries += 1;
+      await sleep(delay, signal);
     }
   }
 

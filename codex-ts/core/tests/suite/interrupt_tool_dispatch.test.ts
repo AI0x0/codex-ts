@@ -147,4 +147,63 @@ describe("interrupt while a tool call is mid-dispatch", () => {
       output: "aborted",
     });
   });
+
+  // mirrors ToolCallRuntime::handle_tool_call_with_source (core/src/tools/
+  // parallel.rs): the turn stops waiting for a tool the moment it is
+  // interrupted — it does not sit on a confirmation nobody answers or a fetch
+  // that never returns — and the tool sees the interrupt through ctx.signal.
+  it("ends the turn at once without waiting for the in-flight tool, which sees the interrupt", async () => {
+    let toolStarted!: () => void;
+    const toolStartedPromise = new Promise<void>((resolve) => {
+      toolStarted = resolve;
+    });
+    let seenSignal: AbortSignal | undefined;
+    const stuckTool: CustomTool = {
+      name: "stuck_tool",
+      spec: () => ({
+        type: "function",
+        tool: {
+          name: "stuck_tool",
+          description: "Never returns.",
+          parameters: { type: "object", properties: {}, additionalProperties: false },
+          strict: false,
+        },
+      }),
+      execute: (_args, ctx) => {
+        seenSignal = ctx.signal;
+        toolStarted();
+        return new Promise<string>(() => {});
+      },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        makeSseResponse(
+          sseFlat([
+            evResponseCreated("r1"),
+            evFunctionCall("call-stuck", "stuck_tool", {}),
+            evCompleted("r1"),
+          ]),
+        ),
+      ),
+    );
+
+    const codex = new CodexThread({
+      apiKey: "test",
+      model: "gpt-4o",
+      customTools: [stuckTool],
+    });
+    await codex.submit({
+      type: "UserInput",
+      items: [{ type: "text", text: "run the stuck tool" }],
+    });
+    await toolStartedPromise;
+    expect(seenSignal?.aborted).toBe(false);
+
+    await codex.submit({ type: "Interrupt" });
+
+    const aborted = await waitForEvent(codex, (m) => m.type === "TurnAborted");
+    expect(aborted.type).toBe("TurnAborted");
+    expect(seenSignal?.aborted).toBe(true);
+  });
 });

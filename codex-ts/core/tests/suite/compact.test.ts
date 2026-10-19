@@ -17,6 +17,7 @@ import {
   SUMMARIZATION_PROMPT,
   SUMMARY_PREFIX,
 } from "../../src/compact.js";
+import type { CompactedUserMessage } from "../../src/compact.js";
 import { CodexThread } from "../../src/codex_thread.js";
 import { SessionTokenState } from "../../src/state/token_state.js";
 import { isContextWindowExceededText } from "../../src/session/retry.js";
@@ -128,7 +129,10 @@ describe("collectUserMessages", () => {
         content: [{ type: "input_text", text: "follow-up" }],
       },
     ];
-    expect(collectUserMessages(history)).toEqual(["hello", "follow-up"]);
+    expect(collectUserMessages(history).map((m) => m.message)).toEqual([
+      "hello",
+      "follow-up",
+    ]);
   });
 
   it("skips assistant and tool messages", () => {
@@ -153,15 +157,29 @@ describe("collectUserMessages", () => {
       },
       { type: "message", role: "user", content: "next ask" },
     ];
-    expect(collectUserMessages(history)).toEqual(["first ask", "next ask"]);
+    expect(collectUserMessages(history).map((m) => m.message)).toEqual([
+      "first ask",
+      "next ask",
+    ]);
     expect(isSummaryMessage(previousSummary)).toBe(true);
     expect(isSummaryMessage("first ask")).toBe(false);
   });
 });
 
+/** A plain-text user message as collectUserMessages returns it. */
+function userMessage(text: string): CompactedUserMessage {
+  return {
+    message: text,
+    original: { type: "message", role: "user", content: text },
+  };
+}
+
 describe("buildCompactedHistory", () => {
   it("produces summary as the last user message", () => {
-    const result = buildCompactedHistory(["msg1", "msg2"], "SUMMARY");
+    const result = buildCompactedHistory(
+      [userMessage("msg1"), userMessage("msg2")],
+      "SUMMARY",
+    );
     const last = result[result.length - 1];
     expect("role" in (last ?? {}) && (last as { role: string }).role).toBe("user");
     expect(JSON.stringify(last)).toContain("SUMMARY");
@@ -171,6 +189,69 @@ describe("buildCompactedHistory", () => {
     const result = buildCompactedHistory([], "");
     const last = result[result.length - 1];
     expect(JSON.stringify(last)).toContain("(no summary available)");
+  });
+});
+
+// mirrors build_compacted_history_with_limit after codex-rs #48115: a text-only
+// message that fits keeps its content parts; anything else is rebuilt from its
+// text alone, middle-truncated with the "…N tokens truncated…" marker.
+describe("buildCompactedHistory — retained user messages", () => {
+  it("keeps a multipart text-only message exactly as it was", () => {
+    const original: ConversationItem = {
+      type: "message",
+      role: "user",
+      content: [
+        { type: "input_text", text: "part one" },
+        { type: "input_text", text: "part two" },
+      ],
+    };
+    const [collected] = collectUserMessages([original]);
+    expect(collected?.message).toBe("part one\npart two");
+    const result = buildCompactedHistory(collected ? [collected] : [], "S");
+    expect(result[0]).toBe(original);
+  });
+
+  it("drops the media of a message with an image and keeps its text", () => {
+    const original: ConversationItem = {
+      type: "message",
+      role: "user",
+      content: [
+        { type: "input_text", text: "look at this" },
+        { type: "input_image", image_url: "https://img.example/a.png" },
+      ],
+    };
+    const result = buildCompactedHistory(collectUserMessages([original]), "S");
+    expect(result[0]).toEqual({
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "look at this" }],
+    });
+  });
+
+  it("leaves a media-only message out (an empty text block is rejected upstream of codex-ts)", () => {
+    const history: ConversationItem[] = [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_image", image_url: "https://img.example/a.png" }],
+      },
+    ];
+    expect(collectUserMessages(history)).toEqual([]);
+  });
+
+  it("middle-truncates the message that overflows the budget and stops there", () => {
+    // COMPACT_USER_MESSAGE_MAX_TOKENS is 20 000 tokens ≈ 80 000 chars.
+    const head = "H".repeat(50_000);
+    const tail = "T".repeat(50_000);
+    const older = userMessage("older message that no longer fits");
+    const huge = userMessage(`${head}${tail}`);
+    const result = buildCompactedHistory([older, huge], "S");
+    // The older one is not reached: the walk stops at the truncated message.
+    expect(result).toHaveLength(2);
+    const parts = (result[0] as { content: { text: string }[] }).content;
+    expect(parts.map((p) => p.text).join("")).toMatch(
+      /^H{40000}…\d+ tokens truncated…T{40000}$/u,
+    );
   });
 });
 
@@ -771,6 +852,88 @@ describe("runInlineAutoCompactTask — trim on context-window-exceeded", () => {
     // Replacement history was still built from the ORIGINAL user messages.
     expect(JSON.stringify(history)).toContain(SUMMARY_PREFIX.slice(0, 30));
     expect(JSON.stringify(history)).toContain("oldest");
+  });
+
+  // codex-rs #53932: the summary is only taken from a COMPLETED response — a
+  // stream that drops leaves history exactly as it was (and is retried).
+  it("never installs a summary from a stream that ended before response.completed", async () => {
+    const history: ConversationItem[] = [
+      { type: "message", role: "user", content: "keep me" },
+    ];
+    const before = structuredClone(history);
+    const fetchMock = vi.fn().mockResolvedValue(
+      makeSseResponse(
+        sseFlat([evResponseCreated("compact"), evAssistantMessage("half a summ")]),
+      ),
+    );
+
+    await expect(
+      runInlineAutoCompactTask(
+        history,
+        turnConfig(fetchMock as unknown as typeof fetch, new SessionTokenState()),
+      ),
+    ).rejects.toThrow(/stream closed before response.completed/u);
+    expect(history).toEqual(before);
+  });
+
+  it("retries a dropped summarizer stream and installs the completed summary", async () => {
+    const history: ConversationItem[] = [
+      { type: "message", role: "user", content: "keep me" },
+    ];
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        makeSseResponse(
+          sseFlat([evResponseCreated("compact"), evAssistantMessage("half")]),
+        ),
+      )
+      .mockResolvedValueOnce(
+        makeSseResponse(
+          sseFlat([
+            evResponseCreated("compact"),
+            evAssistantMessage("whole summary"),
+            evCompleted("compact"),
+          ]),
+        ),
+      );
+
+    const summary = await runInlineAutoCompactTask(history, {
+      ...turnConfig(fetchMock as unknown as typeof fetch, new SessionTokenState()),
+      maxRetries: 1,
+    });
+
+    expect(summary).toBe("whole summary");
+    expect(JSON.stringify(history)).not.toContain("half");
+  });
+
+  // codex-rs #53451: an incomplete compaction response is terminal — no retry,
+  // no partial summary.
+  it("stops on an incomplete summarizer response without retrying", async () => {
+    const history: ConversationItem[] = [
+      { type: "message", role: "user", content: "keep me" },
+    ];
+    const before = structuredClone(history);
+    const fetchMock = vi.fn().mockResolvedValue(
+      makeSseResponse(
+        sseFlat([
+          evResponseCreated("compact"),
+          evAssistantMessage("cut off"),
+          {
+            type: "response.incomplete",
+            response: { id: "compact", incomplete_details: { reason: "max_output_tokens" } },
+          },
+        ]),
+      ),
+    );
+
+    await expect(
+      runInlineAutoCompactTask(history, {
+        ...turnConfig(fetchMock as unknown as typeof fetch, new SessionTokenState()),
+        maxRetries: 3,
+      }),
+    ).rejects.toThrow(/reason: max_output_tokens/u);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(history).toEqual(before);
   });
 
   it("marks tokens full and surfaces the error when nothing is left to trim", async () => {

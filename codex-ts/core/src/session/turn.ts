@@ -24,14 +24,15 @@ import type {
 } from "../../../thread-store/src/types.js";
 import { parseSseStream } from "./sse.js";
 import {
+  classifyHttpFailure,
   classifyStreamFailure,
-  computeRetryDelay,
   DEFAULT_MAX_RETRIES,
   isContextWindowExceededError,
-  isRetryableError,
-  parseRetryAfter,
+  renderContentFilterGuidance,
   ResponsesApiError,
+  retryDelayFor,
   sleep,
+  untilAborted,
 } from "./retry.js";
 import { runInlineAutoCompactTask } from "../compact.js";
 import { normalizeHistory } from "../normalize.js";
@@ -182,9 +183,10 @@ async function runCompactAndRecompute(
   compactWindow: AutoCompactWindow,
   tokenState: SessionTokenState,
   emitEvent: (msg: EventMsg) => void,
+  abortSignal: AbortSignal | undefined,
 ): Promise<void> {
   emitEvent({ type: "ContextCompacted", event: {} });
-  await runInlineAutoCompactTask(history, config);
+  await runInlineAutoCompactTask(history, config, abortSignal);
   // mirrors advance_auto_compact_window (compact.rs:359) followed by
   // replace_compacted_history → replace_history's clear_prefill
   // (state/session.rs:122): one call does both here.
@@ -200,6 +202,89 @@ async function runCompactAndRecompute(
       message:
         "Heads up: Long threads and multiple compactions can cause the model to be less accurate. " +
         "Start a new thread when possible to keep threads small and targeted.",
+    },
+  });
+}
+
+// ─── Token usage of one response ─────────────────────────────────────────────
+
+/**
+ * Account one response's reported `usage` and emit TokenCount.
+ *
+ * mirrors record_token_usage_info (turn.rs) + send_token_count_event
+ * (session/mod.rs). For a completed response (`replaceBaseline`) the session
+ * total ← usage and the window prefill ← the first server-observed
+ * input_tokens. A terminal `response.incomplete` still reports what it
+ * consumed: codex-rs #53670 accounts that usage WITHOUT replacing the context
+ * baseline — taking it as the new baseline could double-count input and
+ * trigger a needless compaction next turn — so it only emits TokenCount.
+ * Missing or malformed usage is ignored rather than estimated.
+ *
+ * In the ts port the session total is REPLACED by each completed response's
+ * total (updateFromUsage), so total_token_usage mirrors last_token_usage with
+ * the session total swapped in. rate_limits: not tracked → null.
+ */
+function recordResponseUsage(
+  response: Record<string, unknown> | undefined,
+  replaceBaseline: boolean,
+  tokenState: SessionTokenState,
+  compactWindow: AutoCompactWindow,
+  config: TurnConfig,
+  emitEvent: (msg: EventMsg) => void,
+): void {
+  const usage = response?.["usage"] as Record<string, unknown> | undefined;
+  if (typeof usage?.["input_tokens"] !== "number") {
+    return;
+  }
+  const inputTokens = usage["input_tokens"];
+  if (replaceBaseline) {
+    tokenState.updateFromUsage({
+      inputTokens,
+      outputTokens:
+        typeof usage["output_tokens"] === "number"
+          ? usage["output_tokens"]
+          : undefined,
+      totalTokens:
+        typeof usage["total_tokens"] === "number"
+          ? usage["total_tokens"]
+          : undefined,
+    });
+    compactWindow.ensureServerObservedPrefill(inputTokens);
+  }
+  const numberOr = (value: unknown, fallback: number): number =>
+    typeof value === "number" ? value : fallback;
+  const inputDetails = usage["input_tokens_details"] as
+    | Record<string, unknown>
+    | undefined;
+  const outputDetails = usage["output_tokens_details"] as
+    | Record<string, unknown>
+    | undefined;
+  const lastUsage = {
+    input_tokens: inputTokens,
+    cached_input_tokens: numberOr(inputDetails?.["cached_tokens"], 0),
+    // mirrors TokenUsage::cache_write_input_tokens ←
+    // usage.input_tokens_details.cache_write_tokens
+    // (codex-api/src/sse/responses.rs).
+    cache_write_input_tokens: numberOr(inputDetails?.["cache_write_tokens"], 0),
+    output_tokens: numberOr(usage["output_tokens"], 0),
+    reasoning_output_tokens: numberOr(outputDetails?.["reasoning_tokens"], 0),
+    total_tokens: numberOr(
+      usage["total_tokens"],
+      inputTokens + numberOr(usage["output_tokens"], 0),
+    ),
+  };
+  emitEvent({
+    type: "TokenCount",
+    event: {
+      info: {
+        total_token_usage: {
+          ...lastUsage,
+          total_tokens: tokenState.totalTokens ?? lastUsage.total_tokens,
+        },
+        last_token_usage: lastUsage,
+        model_context_window: config.contextWindow ?? null,
+      },
+      rate_limits: null,
     },
   });
 }
@@ -322,6 +407,18 @@ export async function runTurn(
     }
   }
 
+  // ── Content-filter recovery guidance (mirrors core/src/responses_retry.rs) ──
+  // When a response is blocked by a content filter, codex-rs records bounded
+  // guidance ahead of re-sampling so the retry does not reproduce the blocked
+  // output. codex-rs records it as a developer message in history; here it is
+  // turn-scoped (like the skill injections above, never persisted) and sent as
+  // a marked role:user item — Browser-specific adaptation: hosts that render the
+  // rollout would show a recorded user-role item as something the user said,
+  // and not every provider behind a Responses-compatible proxy accepts a
+  // developer message mid-input. It stays in every request for the rest of
+  // this turn.
+  const contentFilterGuidance: HistoryItem[] = [];
+
   const tools = router.toolSpecs().map(toolSpecToRequestJson);
   const maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES;
   let lastAgentMessage = "";
@@ -371,6 +468,7 @@ export async function runTurn(
         compactWindow,
         tokenState,
         emitEvent,
+        abortSignal,
       );
     }
   }
@@ -406,6 +504,7 @@ export async function runTurn(
         ...(config.contextItems ?? []),
         ...skillInjectionItems,
         ...history,
+        ...contentFilterGuidance,
       ],
       tools,
       stream: true,
@@ -422,15 +521,19 @@ export async function runTurn(
       [];
     let assistantText = "";
     let currentItemId = `item-${++itemIdCounter}`;
-    let inputTokensThisRound = 0;
     let retryAttempt = 0;
+    // mirrors `needs_follow_up` from a `response.completed` whose `end_turn` is
+    // false (turn.rs: `if let Some(false) = end_turn`) — the server says the
+    // model is not done even without tool calls. `response.incomplete` with
+    // reason "interrupted" maps to exactly that (sse/responses.rs).
+    let needsFollowUp = false;
 
     for (;;) {
       // A retry re-streams from scratch → reset per-attempt accumulators.
       functionCalls.length = 0;
       assistantText = "";
       currentItemId = `item-${++itemIdCounter}`;
-      inputTokensThisRound = 0;
+      needsFollowUp = false;
       let emittedOutput = false;
 
       try {
@@ -449,11 +552,10 @@ export async function runTurn(
 
         if (!res.ok || !res.body) {
           const text = res.body ? await res.text() : "(no body)";
-          throw new ResponsesApiError(
-            res.status,
-            text,
-            parseRetryAfter(res.headers),
-          );
+          // mirrors map_api_error (codex-api/src/api_bridge.rs): the status
+          // plus the payload's error code decide the kind; Retry-After is the
+          // server's advice.
+          throw classifyHttpFailure(res.status, text, res.headers);
         }
 
         // ── Parse SSE stream ──────────────────────────────────────────────
@@ -530,94 +632,55 @@ export async function runTurn(
               // the same "response.completed" (codex-api/src/sse/responses.rs) to read
               // usage. (An earlier port used "response.done", which no Responses
               // backend emits, so usage never arrived and auto-compaction never armed.)
-              // Mirrors record_token_usage_info (turn.rs:2072): session total ←
-              // usage, window prefill ← first server-observed input_tokens.
-              const resp = raw["response"] as
-                | Record<string, unknown>
-                | undefined;
-              const usage = resp?.["usage"] as
-                | Record<string, unknown>
-                | undefined;
-              if (typeof usage?.["input_tokens"] === "number") {
-                inputTokensThisRound = usage["input_tokens"];
-                tokenState.updateFromUsage({
-                  inputTokens: inputTokensThisRound,
-                  outputTokens:
-                    typeof usage["output_tokens"] === "number"
-                      ? usage["output_tokens"]
-                      : undefined,
-                  totalTokens:
-                    typeof usage["total_tokens"] === "number"
-                      ? usage["total_tokens"]
-                      : undefined,
-                });
-                compactWindow.ensureServerObservedPrefill(inputTokensThisRound);
-                // mirrors send_token_count_event (session/mod.rs:3131): emit the
-                // recorded usage so hosts can display context consumption. In the
-                // ts port the session total is REPLACED by each response's total
-                // (updateFromUsage), so total_token_usage mirrors last_token_usage
-                // with the session total swapped in. rate_limits: not tracked → null.
-                const numberOr = (value: unknown, fallback: number): number =>
-                  typeof value === "number" ? value : fallback;
-                const inputDetails = usage["input_tokens_details"] as
-                  | Record<string, unknown>
-                  | undefined;
-                const outputDetails = usage["output_tokens_details"] as
-                  | Record<string, unknown>
-                  | undefined;
-                const lastUsage = {
-                  input_tokens: inputTokensThisRound,
-                  cached_input_tokens: numberOr(
-                    inputDetails?.["cached_tokens"],
-                    0,
-                  ),
-                  // mirrors TokenUsage::cache_write_input_tokens ←
-                  // usage.input_tokens_details.cache_write_tokens
-                  // (codex-api/src/sse/responses.rs:137).
-                  cache_write_input_tokens: numberOr(
-                    inputDetails?.["cache_write_tokens"],
-                    0,
-                  ),
-                  output_tokens: numberOr(usage["output_tokens"], 0),
-                  reasoning_output_tokens: numberOr(
-                    outputDetails?.["reasoning_tokens"],
-                    0,
-                  ),
-                  total_tokens: numberOr(
-                    usage["total_tokens"],
-                    inputTokensThisRound + numberOr(usage["output_tokens"], 0),
-                  ),
-                };
-                emitEvent({
-                  type: "TokenCount",
-                  event: {
-                    info: {
-                      total_token_usage: {
-                        ...lastUsage,
-                        total_tokens:
-                          tokenState.totalTokens ?? lastUsage.total_tokens,
-                      },
-                      last_token_usage: lastUsage,
-                      model_context_window: config.contextWindow ?? null,
-                    },
-                    rate_limits: null,
-                  },
-                });
+              const resp = raw["response"] as Record<string, unknown> | undefined;
+              recordResponseUsage(resp, true, tokenState, compactWindow, config, emitEvent);
+              // mirrors `if let Some(false) = end_turn { needs_follow_up = true }`
+              // (turn.rs): the server says this response did not end the turn.
+              if (resp?.["end_turn"] === false) {
+                needsFollowUp = true;
               }
               break;
             }
-            case "response.failed":
             case "response.incomplete": {
-              // mirrors codex-api sse/responses.rs process_responses_event's
-              // terminal arms (responses.rs:387-431): `response.failed` is
-              // classified from `response.error.code` — quota / cyber-policy /
-              // invalid-prompt / server-overloaded are TERMINAL (rs maps them to
-              // non-retryable CodexErr variants), a rate limit carries its
-              // "try again in Xs" delay, anything unrecognised stays retryable —
-              // and `response.incomplete` becomes a retryable stream error.
-              // context-window-exceeded is detected by the catch below, which
-              // also marks the session tokens full.
+              // mirrors process_responses_event's completed/incomplete arm
+              // (codex-api/src/sse/responses.rs:419): reason "interrupted" is a
+              // completed response that does not end the turn; "content_filter" is a
+              // retryable ContentFilter; any other reason (max_output_tokens…) is a
+              // TERMINAL ResponseIncomplete (#53451) whose reported usage is still
+              // accounted — without replacing the context baseline (#53670).
+              const resp = raw["response"] as Record<string, unknown> | undefined;
+              const details = resp?.["incomplete_details"] as
+                | Record<string, unknown>
+                | undefined;
+              const reason = details?.["reason"];
+              if (reason === "interrupted") {
+                recordResponseUsage(resp, true, tokenState, compactWindow, config, emitEvent);
+                needsFollowUp = true;
+                break;
+              }
+              if (reason !== "content_filter") {
+                recordResponseUsage(resp, false, tokenState, compactWindow, config, emitEvent);
+              }
               throw classifyStreamFailure(raw);
+            }
+            case "response.failed": {
+              // mirrors parse_failed_response (codex-api/src/sse/responses_error.rs):
+              // the error's code picks the kind — quota / policy / invalid-prompt /
+              // flex are TERMINAL, server_is_overloaded retries only on server
+              // advice, a rate limit (or slow_down) carries its delay, anything
+              // unrecognised stays retryable. context-window-exceeded is caught
+              // below, which also marks the session tokens full.
+              throw classifyStreamFailure(raw);
+            }
+            case "error": {
+              // mirrors the `error` arm of process_responses_event
+              // (sse/responses.rs:349): only a Flex capacity failure ends the
+              // stream; any other error event is ignored.
+              const error = raw["error"] as Record<string, unknown> | undefined;
+              if (error?.["code"] === "flex_unavailable") {
+                throw classifyStreamFailure(raw);
+              }
+              break;
             }
           }
         }
@@ -633,13 +696,33 @@ export async function runTurn(
           tokenState.setFull(config.contextWindow);
           throw err;
         }
-        // Stop retrying once visible output streamed (would duplicate), the
-        // budget is spent, or the error is not transient.
+        // A content-filtered response gets its recovery guidance BEFORE the
+        // retry decision (mirrors handle_response_stream_error,
+        // core/src/responses_retry.rs): the re-sampled request must not just
+        // reproduce the blocked output. Added once per turn.
         if (
-          emittedOutput ||
-          retryAttempt >= maxRetries ||
-          !isRetryableError(err)
+          err instanceof ResponsesApiError &&
+          err.kind === "content_filter" &&
+          contentFilterGuidance.length === 0
         ) {
+          const guidance: HistoryItem = {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: renderContentFilterGuidance() }],
+          };
+          contentFilterGuidance.push(guidance);
+          (body["input"] as HistoryItem[]).push(guidance);
+        }
+        // Stop retrying once visible output streamed (would duplicate), the
+        // budget is spent, or the failure is terminal. The delay is the
+        // server's advice when it gave one, else backoff (mirrors
+        // CodexErr::retry_delay; a Retry-After is a deadline, so the time
+        // since the response arrived already counts against it).
+        const delay =
+          emittedOutput || retryAttempt >= maxRetries
+            ? undefined
+            : retryDelayFor(err, retryAttempt + 1);
+        if (delay === undefined) {
           throw err;
         }
         retryAttempt += 1;
@@ -647,7 +730,7 @@ export async function runTurn(
           type: "Warning",
           event: { message: `Reconnecting... ${retryAttempt}/${maxRetries}` },
         });
-        await sleep(computeRetryDelay(err, retryAttempt), abortSignal);
+        await sleep(delay, abortSignal);
       }
     }
 
@@ -678,20 +761,40 @@ export async function runTurn(
 
     // ── Done when no tool calls ─────────────────────────────────────────────
     // …unless something was injected while the model was producing that final
-    // message: then sample once more so it is seen (mirrors codex-rs
+    // message, or the server said the response did not end the turn
+    // (`end_turn: false`, or an incomplete response interrupted server-side):
+    // then sample once more (mirrors codex-rs
     // `needs_follow_up = model_needs_follow_up || has_pending_input`).
-    if (functionCalls.length === 0 && !pendingInjections?.length) break;
+    if (
+      functionCalls.length === 0 &&
+      !pendingInjections?.length &&
+      !needsFollowUp
+    ) {
+      break;
+    }
 
     // ── Dispatch tool calls ─────────────────────────────────────────────────
     // Abort semantics (mirrors codex-rs, where the turn task is killed
-    // outright): once interrupted, never start another tool and DISCARD the
-    // result of the one that was mid-flight — do NOT record it. The next
-    // turn's normalizeHistory synthesizes an "aborted" output for the calls
-    // left unpaired. Recording here instead would race that synthesis: the
-    // new turn inserts "aborted", then this zombie loop lands the real output
-    // too → duplicate outputs for one call_id → Anthropic 400 ("each tool_use
-    // must have a single result") persisted into the thread
-    // (openrouter-responses-errors/2026-07-18/a1cf9c62).
+    // outright): once interrupted, never start another tool, STOP WAITING for
+    // the one that is mid-flight, and DISCARD its result — do NOT record it.
+    //
+    // codex-rs runs each tool call on its own task and select!s it against the
+    // turn's cancellation token (ToolCallRuntime::handle_tool_call_with_source,
+    // core/src/tools/parallel.rs): the moment Interrupt fires it stops waiting,
+    // aborts the tool task and the turn ends with TurnAborted. A JavaScript
+    // promise cannot be cancelled, so untilAborted only stops listening — the
+    // tool runs on in the background, and it receives the same signal (rs hands
+    // handlers the invocation cancellation token) so it can stop its own work.
+    // Waiting for it instead (what this port used to do) left the turn — and
+    // every host flag keyed to it — stuck on a tool that may never return:
+    // a confirmation dialog nobody answers, a long download, a hung fetch.
+    //
+    // The next turn's normalizeHistory synthesizes an "aborted" output for the
+    // calls left unpaired. Recording the late result here instead would race
+    // that synthesis: the new turn inserts "aborted", then this zombie loop
+    // lands the real output too → duplicate outputs for one call_id →
+    // Anthropic 400 ("each tool_use must have a single result") persisted into
+    // the thread (openrouter-responses-errors/2026-07-18/a1cf9c62).
     for (const call of functionCalls) {
       if (abortSignal?.aborted) {
         throw new DOMException("Turn interrupted", "AbortError");
@@ -720,13 +823,19 @@ export async function runTurn(
         continue;
       }
 
-      const output = await router.dispatch(call.name, call.call_id, args, {
-        turnId,
-        pendingInputs,
-        emitEvent,
-      });
+      // An interrupt stops the wait at once (see block comment): the tool is
+      // left to finish on its own, and the turn ends without it.
+      const output = await untilAborted(
+        router.dispatch(call.name, call.call_id, args, {
+          turnId,
+          pendingInputs,
+          emitEvent,
+          signal: abortSignal,
+        }),
+        abortSignal,
+      );
 
-      // Interrupted while this tool ran → drop its output (see block comment).
+      // Interrupted as the tool returned → drop its output (see block comment).
       if (abortSignal?.aborted) {
         throw new DOMException("Turn interrupted", "AbortError");
       }
@@ -764,6 +873,7 @@ export async function runTurn(
           compactWindow,
           tokenState,
           emitEvent,
+          abortSignal,
         );
       }
     }

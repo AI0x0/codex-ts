@@ -74,6 +74,12 @@ export interface TurnStartedEvent {
  * longer hangs on failure.
  */
 export interface TurnCompleteEvent {
+  /**
+   * Resolved causal root for this turn (protocol.rs:2273) — absent on older or
+   * synthetic events. codex-ts has no sub-agent turns, so every turn is its own
+   * root and this always equals `turn_id`.
+   */
+  root_turn_id?: string | undefined;
   turn_id: string;
   last_agent_message?: string | undefined;
   /** Terminal error details when the turn completed unsuccessfully. */
@@ -96,13 +102,21 @@ export type TurnAbortReason =
   | "budget_limited";
 
 /**
- * mirrors TurnAbortedEvent (protocol.rs:4190). codex-rs ends an aborted turn with
+ * mirrors TurnAbortedEvent (protocol.rs:4367). codex-rs ends an aborted turn with
  * THIS event instead of TurnComplete (tasks/mod.rs:785-794), so an interrupted
  * turn has its own terminal event rather than a success-shaped one.
  */
 export interface TurnAbortedEvent {
+  /** Resolved causal root for this turn — see TurnCompleteEvent.root_turn_id. */
+  root_turn_id?: string | undefined;
   turn_id?: string | undefined;
   reason: TurnAbortReason;
+  /**
+   * Optional error describing why the turn was interrupted (protocol.rs:4375).
+   * codex-rs sets it for its Guardian circuit breaker; a plain Op.Interrupt
+   * carries none, so codex-ts never sets it — kept for shape parity.
+   */
+  error?: ErrorEvent | undefined;
   started_at?: number | undefined;
   completed_at?: number | undefined;
   duration_ms?: number | undefined;
@@ -150,7 +164,7 @@ export interface ThreadGoalUpdatedEvent {
 }
 
 /**
- * mirrors codex-rs/protocol/src/protocol.rs CodexErrorInfo (protocol.rs:1758) —
+ * mirrors codex-rs/protocol/src/protocol.rs CodexErrorInfo (protocol.rs:1970) —
  * the client-facing error classification. codex-ts produces the subset it can
  * actually observe over HTTP/SSE (see codexErrorInfoFor in session/retry.ts);
  * the remaining variants are kept for shape parity with rs.
@@ -159,10 +173,18 @@ export type CodexErrorInfo =
   | { type: "context_window_exceeded" }
   | { type: "session_budget_exceeded" }
   | { type: "usage_limit_exceeded" }
+  | { type: "rate_limit_exceeded" }
+  /** Flex-tier capacity unavailable — terminal (`flex_unavailable`). */
+  | { type: "flex_unavailable" }
   | { type: "server_overloaded" }
   | { type: "cyber_policy" }
+  /** Flagged for possible biological risk — terminal (`bio_policy`). */
+  | { type: "bio_policy" }
   | { type: "misalignment_policy_violation" }
-  | { type: "rate_limit_exceeded" }
+  /** Guardian review denials (native only — never produced by codex-ts). */
+  | { type: "too_many_denials" }
+  /** The provider rejected the prompt itself — terminal (`invalid_prompt`). */
+  | { type: "invalid_prompt" }
   | { type: "http_connection_failed"; http_status_code?: number | undefined }
   | {
       type: "response_stream_connection_failed";

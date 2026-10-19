@@ -1,5 +1,8 @@
 /**
- * mirrors codex-rs/core-skills/src/render.rs + injection.rs + skill_instructions.rs
+ * mirrors codex-rs/ext/skills/src/render.rs + fragments.rs (catalog / `<skill>` envelope)
+ *        codex-rs/skills/src/mentions.rs (`$skill-name` mentions)
+ * (upstream moved these out of core-skills; the render.rs:NNN references below
+ * date from that layout)
  *
  * Two-layer skill injection — the layer codex-ts originally dropped, so the
  * model had to grope around with list_dir/read_file every turn:
@@ -44,8 +47,6 @@ const APPROX_BYTES_PER_TOKEN = 4;
 // thousands-of-chars description.
 const MAX_DEFAULT_CONTEXT_SKILL_DESCRIPTION_CHARS = 1_024;
 const TRUNCATED_SKILL_DESCRIPTION_SUFFIX = "...";
-// mirrors SKILL_DESCRIPTION_TRUNCATION_WARNING_THRESHOLD_CHARS (render.rs:22)
-const SKILL_DESCRIPTION_TRUNCATION_WARNING_THRESHOLD_CHARS = 100;
 
 const TEXT_ENCODER = new TextEncoder();
 
@@ -164,17 +165,6 @@ export interface SkillRenderReport {
   omittedCount: number;
   truncatedDescriptionChars: number;
   truncatedDescriptionCount: number;
-}
-
-/** mirrors SkillRenderReport::average_truncated_description_chars (render.rs:431) */
-function averageTruncatedDescriptionChars(report: SkillRenderReport): number {
-  if (report.totalCount === 0 || report.truncatedDescriptionChars === 0) {
-    return 0;
-  }
-  return Math.floor(
-    (report.truncatedDescriptionChars + report.totalCount - 1) /
-      report.totalCount,
-  );
 }
 
 interface DescriptionBudgetLine {
@@ -382,48 +372,22 @@ const SKILLS_HOW_TO_USE = `- Discovery: The list above is the skills available i
   - When variants exist (frameworks, providers, domains), pick only the relevant reference file(s) and note that choice.
 - Safety and fallback: If a skill can't be applied cleanly (missing files, unclear instructions), state the issue, pick the next-best approach, and continue.`;
 
-// render.rs warning constants (verbatim)
+// render.rs warning constant (verbatim)
 const SKILL_DESCRIPTIONS_REMOVED_WARNING_PREFIX =
   "Exceeded skills context budget. All skill descriptions were removed and";
-const SKILL_DESCRIPTION_TRUNCATED_WARNING =
-  "Skill descriptions were shortened to fit the skills context budget. " +
-  "Codex can still see every skill, but some descriptions are shorter. " +
-  "Disable unused skills or plugins to leave more room for the rest.";
-const SKILL_DESCRIPTION_TRUNCATED_WARNING_WITH_PERCENT =
-  "Skill descriptions were shortened to fit the 2% skills context budget. " +
-  "Codex can still see every skill, but some descriptions are shorter. " +
-  "Disable unused skills or plugins to leave more room for the rest.";
 
 /**
- * Build the omission / truncation warning for a render report.
- * mirrors build_available_skills_from_lines's warning_message (render.rs:208):
- * omission wins over truncation, and truncation only warns once the AVERAGE
- * dropped description exceeds SKILL_DESCRIPTION_TRUNCATION_WARNING_THRESHOLD_CHARS.
+ * Build the omission warning for a render report.
+ * mirrors SkillRenderReport::warning_message (ext/skills/src/render.rs): only
+ * skills left out of the catalog warn. Upstream dropped the "descriptions
+ * were shortened" warning — every skill is still listed, so it was noise.
  */
-function buildCatalogWarning(
-  report: SkillRenderReport,
-  budget: SkillMetadataBudget,
-): string | null {
+function buildCatalogWarning(report: SkillRenderReport): string | null {
   if (report.omittedCount > 0) {
     const omitted = report.omittedCount;
     const skillWord = omitted === 1 ? "skill" : "skills";
     const verb = omitted === 1 ? "was" : "were";
-    const prefix =
-      budget.kind === "tokens"
-        ? SKILL_DESCRIPTIONS_REMOVED_WARNING_PREFIX.replace(
-            "skills context budget",
-            "2% skills context budget",
-          )
-        : SKILL_DESCRIPTIONS_REMOVED_WARNING_PREFIX;
-    return `${prefix} ${omitted} additional ${skillWord} ${verb} not included in the model-visible skills list.`;
-  }
-  if (
-    averageTruncatedDescriptionChars(report) >
-    SKILL_DESCRIPTION_TRUNCATION_WARNING_THRESHOLD_CHARS
-  ) {
-    return budget.kind === "tokens"
-      ? SKILL_DESCRIPTION_TRUNCATED_WARNING_WITH_PERCENT
-      : SKILL_DESCRIPTION_TRUNCATED_WARNING;
+    return `${SKILL_DESCRIPTIONS_REMOVED_WARNING_PREFIX} ${omitted} additional ${skillWord} ${verb} not included in the model-visible skills list.`;
   }
   return null;
 }
@@ -473,7 +437,7 @@ export function renderAvailableSkills(
   ];
   return {
     body: `\n${out.join("\n")}\n`,
-    warningMessage: buildCatalogWarning(report, budget),
+    warningMessage: buildCatalogWarning(report),
     report,
   };
 }

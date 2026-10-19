@@ -280,3 +280,37 @@ describe("normalizeRequestUserInputArgs guards a malformed questions field", () 
     }
   });
 });
+
+// The question dies with its turn: an interrupt ends a turn that is waiting for
+// an answer right away, without the host having to answer it first.
+describe("request_user_input_interrupted", () => {
+  it("ends with TurnAborted without an answer, and a late answer is a no-op", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        makeSseResponse(makeRequestUserInputArgs("call-rui-int")),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const codex = new CodexThread({ apiKey: "test", model: "gpt-4o" });
+    await codex.submit({
+      type: "UserInput",
+      items: [{ type: "text", text: "please confirm" }],
+    });
+    const request = await waitForEventMatch<RequestUserInputEvent>(
+      codex,
+      (msg) => (msg.type === "RequestUserInput" ? msg.event : null),
+    );
+
+    await codex.submit({ type: "Interrupt" });
+    await waitForEvent(codex, (m) => m.type === "TurnAborted");
+
+    // Answering the abandoned question changes nothing and starts nothing.
+    await codex.submit({
+      type: "UserInputAnswer",
+      id: request.turn_id,
+      response: { answers: {} },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});

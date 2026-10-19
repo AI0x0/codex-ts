@@ -2,7 +2,7 @@
 
 轻量级 TypeScript agent harness，完全照搬 [openai/codex](https://github.com/openai/codex) Rust 实现（`codex-rs`）的架构设计，可在**浏览器**和 **Node.js** 中直接运行，无任何原生依赖。
 
-本仓库 fork 自 [`openai/codex@a592c38c`](https://github.com/openai/codex/commit/a592c38cf)，新增代码全部在 `codex-ts/` 目录，不修改上游文件。
+本仓库 fork 自 [`openai/codex@89461ea6`](https://github.com/openai/codex/commit/89461ea6833832b0551ce24ee32205824d5c108d)，新增代码全部在 `codex-ts/` 目录，不修改上游文件。
 
 ---
 
@@ -614,7 +614,7 @@ const thread = new CodexThread({
 });
 ```
 
-`CustomToolContext` 提供 `callId`、`turnId` 和 `emitEvent`，供需要发送中间事件的工具使用。
+`CustomToolContext` 提供 `callId`、`turnId` 和 `emitEvent`，供需要发送中间事件的工具使用；另有 `signal`——这一轮的中断信号。Interrupt 一到，这一轮立刻不再等这次调用、丢掉它的结果（对应 codex-rs 交给每个工具处理器的取消令牌），工具应在这里停掉自己的活：收掉挂着的确认、取消请求、跳过会花钱的步骤。
 
 如果工具是项目内置的，也可以直接在 `core/src/tools/router.ts` 的 `dispatch` 加 `case`（参考 `update_plan` 的写法）。
 
@@ -687,27 +687,31 @@ codex-ts/
 
 `codex-ts/` 的所有实现均对照 codex-rs 在以下提交时的源码逐一照搬：
 
-**[`a592c38c`](https://github.com/openai/codex/commit/a592c38cf) — Use OpenSSL 3.6.4 for musl builds (#45149)**
+**[`89461ea6`](https://github.com/openai/codex/commit/89461ea6833832b0551ce24ee32205824d5c108d) — Prune unused standalone releases after successful installation (#55149)**
 
-以后同步上游时，以这个哈希为起点与新版本做 diff，确认哪些 Rust 侧变更需要同步到 codex-ts 的对应 `.ts` 文件：
+以后同步上游时，以这个哈希为起点与新版本做 diff，确认哪些 Rust 侧变更需要同步到 codex-ts 的对应 `.ts` 文件。本 fork 不合并上游历史，所以对照拉下来的 `upstream/main`：
 
 ```bash
 # 查看上游在参照提交之后的变更
-git diff a592c38c HEAD -- codex-rs/protocol/src/protocol.rs
-git diff a592c38c HEAD -- codex-rs/ext/goal/src/spec.rs
+git diff 89461ea6 upstream/main -- codex-rs/protocol/src/protocol.rs
+git diff 89461ea6 upstream/main -- codex-rs/ext/goal/src/spec.rs
 # 依此类推对照上方映射表逐文件检查
 ```
 
 同步完成后将上方哈希替换为新的参照提交。
 
-`6bcccb0e` → 本参照提交之间上游挪动过位置的文件（diff 为空时先查这里）：
+`6bcccb0e` 以来上游挪动过位置的文件（diff 为空时先查这里）：
 
 | 原位置                                                     | 现位置                                                               |
 | ---------------------------------------------------------- | -------------------------------------------------------------------- |
 | `core/src/session/turn.rs` — `auto_compact_token_status`   | `core/src/session/context_window.rs` — `context_window_token_status` |
 | `core-skills/src/manager.rs`                               | `core-skills/src/service.rs`                                         |
-| `core-skills/src/render.rs` — `### How to use skills` 段落 | `core/src/context/available_skills_instructions.rs`                  |
+| `core-skills/src/render.rs` — `### How to use skills` 段落 | `ext/skills/src/fragments.rs` — `AvailableSkillsInstructions`        |
+| `core-skills/src/render.rs` — 目录行 / 预算                | `ext/skills/src/render.rs`                                           |
+| `core-skills/src/injection.rs` — `$skill` 提及             | `skills/src/mentions.rs`                                             |
 | `state/auto_compact_window.rs` — `start_next` / `ordinal`  | `advance` / `window_number` + `AutoCompactWindowIds`                 |
+| `core/src/util.rs` — `backoff`                             | `async-utils/src/backoff.rs`                                         |
+| `codex-api/src/sse/responses.rs` — `response.failed` 解析  | `codex-api/src/sse/responses_error.rs` — `parse_failed_response`     |
 
 **有意未照搬**的上游能力（纯 native、浏览器无对应实现）：`token_budget`
 提醒与 fallback prompt（feature 开关 + 配置层）、远端压缩
@@ -724,6 +728,40 @@ git diff a592c38c HEAD -- codex-rs/ext/goal/src/spec.rs
 `rate_limit_exceeded` 与 `misalignment_policy_violation`；历史 token 估算改为按
 模型可见内容统计，不再序列化整个 envelope；协议事件补齐较新的上游字段。
 remote compaction、权限/批准、插件、realtime、app-server 等纯原生系统仍不在范围。
+
+### 2026-10-19 同步说明
+
+对照 `89461ea6`（`a592c38c` 之后上游 1652 个提交）逐个复核镜像文件，同步了浏览器可用的部分：
+
+- **中断不再等在跑的工具。** codex-rs 让每次工具调用都和这一轮的取消令牌赛跑
+  （`core/src/tools/parallel.rs`）；codex-ts 原先死等 dispatch，`TurnAborted`
+  要等工具回来才发——一个没人回答的确认框就能让这一轮一直挂着。现在 Interrupt
+  一到就不再等（没人回答的 `request_user_input` 也一样），自定义工具通过
+  `ctx.signal` 拿到中断，内联压缩也认中断。
+- **Responses 失败分类**（`sse/responses_error.rs`、`api_bridge.rs`、
+  `CodexErr::retry_delay`）：失败事件 `response.error.headers` 里的 Retry-After；
+  更多「额度用尽」类错误码；`bio_policy`、`invalid_prompt`、`flex_unavailable`
+  各有自己的 `CodexErrorInfo`；`slow_down` 归为可重试的限流；`server_is_overloaded`
+  只在服务器给了重试建议时重试；其余 HTTP 状态归为 `http_connection_failed`；
+  服务器建议按截止时刻计算（从收到响应起算）。
+- **`response.incomplete`** 改为终止错误（#53451），content filter 例外——重试时
+  带上恢复引导（#49119）；它报告的用量照样上报，但不替换上下文基线（#53670）；
+  `reason: "interrupted"` 与 `response.completed` 的 `end_turn: false` 一样，接着再采样。
+- **压缩** 只认已完成响应里的摘要（#53932），保留的纯文本用户消息逐段原样保留
+  （#48115），截断改为保留头尾。
+- **技能**：删掉「描述被截短」的提醒。
+- **协议**：`TurnComplete` / `TurnAborted` 加 `root_turn_id`，`TurnAborted.error`，
+  新的 `CodexErrorInfo` 成员。
+- **注入**：回合收尾期间注入的输入，在这一轮结束后立即记入历史（#53452）。
+
+浏览器侧的适配：content-filter 引导只在当前这一轮生效，作为带标记的 user 消息发送
+（codex-rs 记成 developer 消息）；纯媒体的用户消息不进压缩后的历史（部分供应商拒绝
+空文本块）；普通的 HTTP 429 / 5xx 仍按状态码重试（codex-rs 在 HTTP 客户端里先重试过，
+回合循环看到的已是重试之后的结果）。
+
+未同步（纯原生或上游可选特性）：`instant_interrupt` 抢占、回合后 / 后台 / remote
+压缩、`InterruptIfNoPendingInput`、Guardian、多 agent 邮件、executor / cloud 技能目录、
+thread-store 分页与血缘、按文件引用的图片。
 
 ### 源码注释约定
 
@@ -742,35 +780,34 @@ remote compaction、权限/批准、插件、realtime、app-server 等纯原生�
 # 添加上游源（仅首次）
 git remote add upstream git@github.com:openai/codex.git
 
-# 拉取并 rebase
-git fetch upstream
-git rebase upstream/main
-
-# 如有冲突，仅 pnpm-workspace.yaml 需手动保留 codex-ts 这一行
+# 拉取后逐文件移植：从上方参照提交 diff 到 upstream/main，更新对应的 .ts 文件，
+# 最后把参照提交换成新的
+git fetch upstream main --no-tags
+git diff <参照提交> upstream/main -- codex-rs/core/src/session/turn.rs
 ```
 
 当上游 `codex-rs` 有变更时，按对应关系更新 `codex-ts` 的镜像文件：
 
-| 上游变更                                                     | 需更新的 codex-ts 文件                                                                              |
-| ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
-| `protocol/src/protocol.rs` — 新增 EventMsg 变体              | `protocol/src/protocol.ts`                                                                          |
-| `ext/goal/src/spec.rs` — schema 调整                         | `ext/goal/src/spec.ts`                                                                              |
-| `request_user_input_spec.rs` — 字段变更                      | `core/src/tools/handlers/request_user_input_spec.ts`                                                |
-| `plan_spec.rs` / `plan_tool.rs` — schema 变更                | `core/src/tools/handlers/plan_spec.ts` + `protocol/src/plan_tool.ts`                                |
-| `thread-store/src/store.rs` — 接口变更                       | `thread-store/src/store.ts`                                                                         |
-| `state/src/runtime/goals.rs` — accounting 逻辑变更           | `state/src/runtime/goals.ts`                                                                        |
-| `compact.rs` — 压缩逻辑变更                                  | `core/src/compact.ts`                                                                               |
-| `state/auto_compact_window.rs` — 压缩窗口变更                | `core/src/state/auto_compact_window.ts`                                                             |
-| `session/context_window.rs` — 压缩触发条件变更               | `core/src/session/turn.ts` 的 `autoCompactTokenStatus`                                              |
-| `prompts/templates/compact/prompt.md` — 摘要 prompt          | `core/src/compact.ts` 的 `SUMMARIZATION_PROMPT`                                                     |
-| `codex-api/src/sse/responses.rs` — SSE 事件 / 错误分类       | `core/src/session/turn.ts` + `core/src/session/retry.ts`                                            |
-| `protocol/src/error.rs` — `CodexErrorInfo` / 可重试判定      | `protocol/src/protocol.ts` 的 `CodexErrorInfo` + `core/src/session/retry.ts` 的 `codexErrorInfoFor` |
-| `core-skills/src/render.rs` — catalog 文案 / 预算            | `core/src/skills.ts`                                                                                |
-| `protocol/src/user_input.rs` + `models.rs` — 新增输入模态    | `protocol/src/user_input.ts` + `thread-store/src/types.ts` 的 `UserContentPart`                     |
-| 新增工具                                                     | `core/src/tools/router.ts`                                                                          |
-| `tools/handlers/shell_spec.rs` — 命令 schema / approval 参数 | `host/src/exec/spec.ts` + `host/src/backend/types.ts`                                               |
-| `tools/sandboxing.rs` — approval / escalation policy         | `host/src/approvals/policy.ts`                                                                      |
-| `sandboxing/seatbelt.rs` + `windows-sandbox-rs`              | 留在宿主 backend；不要搬进 mirror 文件                                                              |
+| 上游变更                                                                      | 需更新的 codex-ts 文件                                                                              |
+| ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `protocol/src/protocol.rs` — 新增 EventMsg 变体                               | `protocol/src/protocol.ts`                                                                          |
+| `ext/goal/src/spec.rs` — schema 调整                                          | `ext/goal/src/spec.ts`                                                                              |
+| `request_user_input_spec.rs` — 字段变更                                       | `core/src/tools/handlers/request_user_input_spec.ts`                                                |
+| `plan_spec.rs` / `plan_tool.rs` — schema 变更                                 | `core/src/tools/handlers/plan_spec.ts` + `protocol/src/plan_tool.ts`                                |
+| `thread-store/src/store.rs` — 接口变更                                        | `thread-store/src/store.ts`                                                                         |
+| `state/src/runtime/goals.rs` — accounting 逻辑变更                            | `state/src/runtime/goals.ts`                                                                        |
+| `compact.rs` — 压缩逻辑变更                                                   | `core/src/compact.ts`                                                                               |
+| `state/auto_compact_window.rs` — 压缩窗口变更                                 | `core/src/state/auto_compact_window.ts`                                                             |
+| `session/context_window.rs` — 压缩触发条件变更                                | `core/src/session/turn.ts` 的 `autoCompactTokenStatus`                                              |
+| `prompts/templates/compact/prompt.md` — 摘要 prompt                           | `core/src/compact.ts` 的 `SUMMARIZATION_PROMPT`                                                     |
+| `codex-api/src/sse/responses.rs` + `responses_error.rs` — SSE 事件 / 错误分类 | `core/src/session/turn.ts` + `core/src/session/retry.ts`                                            |
+| `protocol/src/error.rs` — `CodexErrorInfo` / 可重试判定                       | `protocol/src/protocol.ts` 的 `CodexErrorInfo` + `core/src/session/retry.ts` 的 `codexErrorInfoFor` |
+| `ext/skills/src/render.rs` + `fragments.rs` — catalog 文案 / 预算             | `core/src/skills.ts`                                                                                |
+| `protocol/src/user_input.rs` + `models.rs` — 新增输入模态                     | `protocol/src/user_input.ts` + `thread-store/src/types.ts` 的 `UserContentPart`                     |
+| 新增工具                                                                      | `core/src/tools/router.ts`                                                                          |
+| `tools/handlers/shell_spec.rs` — 命令 schema / approval 参数                  | `host/src/exec/spec.ts` + `host/src/backend/types.ts`                                               |
+| `tools/sandboxing.rs` — approval / escalation policy                          | `host/src/approvals/policy.ts`                                                                      |
+| `sandboxing/seatbelt.rs` + `windows-sandbox-rs`                               | 留在宿主 backend；不要搬进 mirror 文件                                                              |
 
 ---
 

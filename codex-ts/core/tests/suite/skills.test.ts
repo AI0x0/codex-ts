@@ -241,21 +241,21 @@ describe("catalog budget (mirrors render.rs)", () => {
     );
   });
 
-  it("stays silent when only a little description text is dropped (mirrors render.rs threshold)", () => {
-    // mirrors SKILL_DESCRIPTION_TRUNCATION_WARNING_THRESHOLD_CHARS (render.rs:22)
-    // via average_truncated_description_chars: these 74-char descriptions lose
-    // ~54 chars each, under the 100-char average, so rs emits NO warning.
+  it("stays silent when description text is dropped (mirrors render.rs warning_message)", () => {
+    // Upstream dropped the "descriptions were shortened" warning: every skill is
+    // still listed, so trimming descriptions — a little or a lot — says nothing.
     const out = renderSkillsCatalog(many, { kind: "characters", limit: 350 });
     expect(out).not.toContain("shortened to fit");
-  });
-
-  it("appends truncation warning once the average dropped description exceeds the threshold", () => {
     const verbose: SkillMetadata[] = many.map((skill) => ({
       ...skill,
       description: "x".repeat(400),
     }));
-    const out = renderSkillsCatalog(verbose, { kind: "characters", limit: 350 });
-    expect(out).toContain("Skill descriptions were shortened to fit the skills context budget.");
+    const verboseOut = renderSkillsCatalog(verbose, {
+      kind: "characters",
+      limit: 350,
+    });
+    expect(verboseOut).not.toContain("shortened to fit");
+    expect(verboseOut).not.toContain("not included in the model-visible skills list.");
   });
 
   it("caps a single description at MAX_DEFAULT_CONTEXT_SKILL_DESCRIPTION_CHARS", () => {

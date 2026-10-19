@@ -38,7 +38,16 @@ export interface ToolRouterContext {
   pendingInputs: PendingInputs;
   /** Emit an event immediately — used for events that must fire before suspension */
   emitEvent: (msg: EventMsg) => void;
+  /**
+   * The turn's interrupt signal (mirrors the cancellation token codex-rs
+   * threads into tool dispatch). Handed on to custom tools; omitted when the
+   * turn has no interrupt hook.
+   */
+  signal?: AbortSignal | undefined;
 }
+
+/** Stand-in for a turn that cannot be interrupted: a signal that never aborts. */
+const NEVER_ABORTED: AbortSignal = new AbortController().signal;
 
 // =============================================================================
 // Browser-specific extension — no direct equivalent in codex-rs.
@@ -50,12 +59,22 @@ export interface ToolRouterContext {
 
 /**
  * Context handed to a CustomTool's execute(). Carries the identifiers a host
- * needs to correlate the call (callId / turnId) and an emitEvent escape hatch.
+ * needs to correlate the call (callId / turnId), an emitEvent escape hatch, and
+ * the turn's interrupt signal.
  */
 export interface CustomToolContext {
   callId: string;
   turnId: string;
   emitEvent: (msg: EventMsg) => void;
+  /**
+   * Aborts when the turn is interrupted. mirrors the invocation cancellation
+   * token codex-rs hands every tool handler (ToolInvocation /
+   * core/src/tools/parallel.rs): on Interrupt the turn stops waiting for this
+   * call at once and drops whatever it returns, so a tool should stop its own
+   * work here — close a pending confirmation, cancel a request, skip a step
+   * that would spend money.
+   */
+  signal: AbortSignal;
 }
 
 /**
@@ -218,6 +237,7 @@ export class ToolRouter {
             callId,
             turnId: ctx.turnId,
             emitEvent: ctx.emitEvent,
+            signal: ctx.signal ?? NEVER_ABORTED,
           });
         }
         return JSON.stringify({ error: `Unknown tool: ${toolName}` });
