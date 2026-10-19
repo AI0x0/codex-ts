@@ -19,6 +19,8 @@ use crate::ExecutionStatus;
 fn sub_agent_activity_is_a_terminal_tool_runtime_event() -> anyhow::Result<()> {
     let agent_thread_id = ThreadId::new();
     let event = EventMsg::SubAgentActivity(SubAgentActivityEvent {
+        model: Some("gpt-5".into()),
+        reasoning_effort: Some(codex_protocol::openai_models::ReasoningEffort::High),
         event_id: "call-spawn".to_string(),
         occurred_at_ms: 1234,
         agent_thread_id,
@@ -44,9 +46,27 @@ fn sub_agent_activity_is_a_terminal_tool_runtime_event() -> anyhow::Result<()> {
             "occurred_at_ms": 1234,
             "agent_thread_id": agent_thread_id,
             "agent_path": "/root/reviewer",
-            "kind": "started"
+            "kind": "started",
+            "model": "gpt-5",
+            "reasoning_effort": "high"
         })
     );
+    Ok(())
+}
+
+#[test]
+fn completed_sub_agent_activity_is_not_a_tool_runtime_event() -> anyhow::Result<()> {
+    let event = EventMsg::SubAgentActivity(SubAgentActivityEvent {
+        model: None,
+        reasoning_effort: None,
+        event_id: "child-turn-completed".to_string(),
+        occurred_at_ms: 1234,
+        agent_thread_id: ThreadId::new(),
+        agent_path: AgentPath::try_from("/root/reviewer").map_err(anyhow::Error::msg)?,
+        kind: SubAgentActivityKind::Completed,
+    });
+
+    assert!(tool_runtime_trace_event(&event).is_none());
     Ok(())
 }
 
@@ -79,12 +99,9 @@ fn exec_command_trace_payloads_use_inferred_native_cwd() -> anyhow::Result<()> {
         parsed_cmd: Vec::new(),
         source: ExecCommandSource::UnifiedExecInteraction,
         interaction_input: Some("input".to_string()),
-        stdout: "output".to_string(),
-        stderr: String::new(),
-        aggregated_output: "output".to_string(),
+        aggregated_output: "combined output".to_string(),
         exit_code: 0,
         duration: Duration::from_millis(250),
-        formatted_output: "output".to_string(),
         status: ExecCommandStatus::Completed,
     });
 
@@ -124,12 +141,9 @@ fn exec_command_trace_payloads_use_inferred_native_cwd() -> anyhow::Result<()> {
             "parsed_cmd": [],
             "source": "unified_exec_interaction",
             "interaction_input": "input",
-            "stdout": "output",
-            "stderr": "",
-            "aggregated_output": "output",
+            "aggregated_output": "combined output",
             "exit_code": 0,
             "duration": {"secs": 0, "nanos": 250000000},
-            "formatted_output": "output",
             "status": "completed"
         })
     );

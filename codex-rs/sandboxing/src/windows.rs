@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -29,14 +30,8 @@ pub struct WindowsSandboxFilesystemOverrides {
     pub additional_deny_write_paths: Vec<AbsolutePathBuf>,
 }
 
-pub fn windows_sandbox_uses_elevated_backend(
-    sandbox_level: WindowsSandboxLevel,
-    proxy_enforced: bool,
-) -> bool {
-    // Windows firewall enforcement is tied to the logon-user sandbox identities, so
-    // proxy-enforced sessions must use that backend even when the configured mode is
-    // the default restricted-token sandbox.
-    proxy_enforced || matches!(sandbox_level, WindowsSandboxLevel::Elevated)
+pub fn windows_sandbox_uses_elevated_backend(sandbox_level: WindowsSandboxLevel) -> bool {
+    matches!(sandbox_level, WindowsSandboxLevel::Elevated)
 }
 
 pub fn permission_profile_supports_windows_restricted_token_sandbox(
@@ -62,6 +57,7 @@ pub fn unsupported_windows_restricted_token_sandbox_reason(
             permission_profile,
             sandbox_policy_cwd,
             windows_sandbox_level == WindowsSandboxLevel::Elevated,
+            &HashMap::new(),
         )
         .err()
     } else {
@@ -221,6 +217,7 @@ pub fn resolve_windows_elevated_filesystem_overrides(
     permission_profile: &PermissionProfile,
     sandbox_policy_cwd: &AbsolutePathBuf,
     use_windows_elevated_backend: bool,
+    workload_env: &HashMap<String, String>,
 ) -> std::result::Result<Option<WindowsSandboxFilesystemOverrides>, String> {
     if sandbox != SandboxType::WindowsRestrictedToken || !use_windows_elevated_backend {
         return Ok(None);
@@ -242,6 +239,14 @@ pub fn resolve_windows_elevated_filesystem_overrides(
     // deny-write sentinels.
     file_system_sandbox_policy.remove_skip_missing_path_entries();
 
+    #[cfg(target_os = "windows")]
+    codex_windows_sandbox::resolve_workload_temp_paths(
+        &mut file_system_sandbox_policy,
+        workload_env,
+    );
+    #[cfg(not(target_os = "windows"))]
+    let _ = workload_env;
+
     let additional_deny_read_paths = codex_windows_sandbox::resolve_windows_deny_read_paths(
         &file_system_sandbox_policy,
         sandbox_policy_cwd,
@@ -260,8 +265,10 @@ pub fn resolve_windows_elevated_filesystem_overrides(
         .needs_direct_runtime_enforcement(network_sandbox_policy, sandbox_policy_cwd);
     let has_explicit_write_carveouts = split_writable_roots.iter().any(|writable_root| {
         writable_root.read_only_subpaths.iter().any(|path| {
-            file_system_sandbox_policy
-                .has_explicit_non_write_entry_for_path_with_cwd(path.as_path(), sandbox_policy_cwd)
+            file_system_sandbox_policy.has_explicit_non_write_entry_for_local_path_with_cwd(
+                path.as_path(),
+                sandbox_policy_cwd,
+            )
         })
     });
     let normalize_path = |path: PathBuf| dunce::canonicalize(&path).unwrap_or(path);
@@ -328,7 +335,7 @@ pub fn resolve_windows_elevated_filesystem_overrides(
                     })
                 });
                 let explicitly_configured = file_system_sandbox_policy
-                    .has_explicit_non_write_entry_for_path_with_cwd(
+                    .has_explicit_non_write_entry_for_local_path_with_cwd(
                         read_only_subpath.as_path(),
                         sandbox_policy_cwd,
                     );
@@ -376,7 +383,7 @@ fn windows_policy_has_root_read_access(
     let Some(root) = cwd.as_path().ancestors().last() else {
         return false;
     };
-    file_system_sandbox_policy.can_read_path_with_cwd(root, cwd.as_path())
+    file_system_sandbox_policy.can_read_local_path_with_cwd(root, cwd.as_path())
 }
 
 fn permission_profile_display_name(permission_profile: &PermissionProfile) -> &'static str {
@@ -403,3 +410,7 @@ fn has_reopened_writable_descendant(writable_roots: &[WritableRoot]) -> bool {
             })
     })
 }
+
+#[cfg(all(test, target_os = "windows"))]
+#[path = "windows_tests.rs"]
+mod tests;

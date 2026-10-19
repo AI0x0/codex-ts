@@ -9,6 +9,7 @@ use crate::tools::handlers::get_context_remaining_spec::GET_CONTEXT_REMAINING_TO
 use crate::tools::handlers::get_context_remaining_spec::create_get_context_remaining_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -25,7 +26,7 @@ impl GetContextRemainingOutput {
         Self { tokens_left }
     }
 
-    fn fragment(&self) -> String {
+    fn fragment(&self) -> ContentItem {
         match self.tokens_left {
             Some(tokens_left) => {
                 crate::context::TokenBudgetRemainingContext::new(tokens_left).render()
@@ -36,8 +37,8 @@ impl GetContextRemainingOutput {
 }
 
 impl ToolOutput for GetContextRemainingOutput {
-    fn log_preview(&self) -> String {
-        self.fragment()
+    fn log_output(&self) -> String {
+        self.fragment().into_text().unwrap_or_default()
     }
 
     fn success_for_logging(&self) -> bool {
@@ -45,7 +46,7 @@ impl ToolOutput for GetContextRemainingOutput {
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
-        FunctionToolOutput::from_text(self.fragment(), Some(true))
+        FunctionToolOutput::from_content(vec![self.fragment().into()], Some(true))
             .to_response_item(call_id, payload)
     }
 
@@ -63,11 +64,18 @@ impl ToolExecutor<ToolInvocation> for GetContextRemainingHandler {
         ToolName::plain(GET_CONTEXT_REMAINING_TOOL_NAME)
     }
 
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         create_get_context_remaining_tool()
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             if !matches!(invocation.payload, ToolPayload::Function { .. }) {
                 return Err(FunctionCallError::RespondToModel(

@@ -12,19 +12,19 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_rollout::RolloutItem;
 use codex_utils_output_truncation::approx_tokens_from_byte_count_i64;
 use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
 
-const EXTERNAL_SESSION_IMPORTED_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
+pub(super) const EXTERNAL_SESSION_IMPORTED_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
 
 #[cfg(test)]
 fn load_session_for_import(path: &Path) -> io::Result<Option<ImportedExternalAgentSession>> {
@@ -82,7 +82,7 @@ pub(crate) fn load_session_for_import_with_content_sha256(
     )))
 }
 
-fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<RolloutItem> {
+pub(super) fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<RolloutItem> {
     let mut items = Vec::new();
     let mut current_turn = None;
     let mut response_item_bytes = 0i64;
@@ -105,7 +105,9 @@ fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<Rollou
                 let turn_id = format!("external-import-turn-{user_turn_count}");
                 items.push(RolloutItem::EventMsg(EventMsg::TurnStarted(
                     TurnStartedEvent {
+                        turn_attribution: None,
                         turn_id: turn_id.clone(),
+                        root_turn_id: None,
                         trace_id: None,
                         started_at,
                         model_context_window: None,
@@ -120,7 +122,7 @@ fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<Rollou
                 )));
                 response_item_bytes =
                     response_item_bytes.saturating_add(message_byte_count(&message));
-                items.push(RolloutItem::ResponseItem(response_item(message)));
+                items.push(RolloutItem::ResponseItem(response_item(message).into()));
                 current_turn = Some((turn_id, started_at));
             }
             MessageRole::Assistant => {
@@ -135,9 +137,11 @@ fn rollout_items_from_messages(messages: Vec<ConversationMessage>) -> Vec<Rollou
                         message: message.text.clone(),
                         phase: None,
                         memory_citation: None,
+                        delivery: None,
+                        questions: None,
                     },
                 )));
-                items.push(RolloutItem::ResponseItem(response_item(message)));
+                items.push(RolloutItem::ResponseItem(response_item(message).into()));
             }
         }
     }
@@ -156,15 +160,23 @@ fn external_session_imported_marker_item() -> RolloutItem {
         message: EXTERNAL_SESSION_IMPORTED_MARKER.to_string(),
         phase: None,
         memory_citation: None,
+        delivery: None,
+        questions: None,
     }))
 }
 
 fn response_item(message: ConversationMessage) -> ResponseItem {
     let content = match message.role {
-        MessageRole::Assistant => ContentItem::OutputText { text: message.text },
+        MessageRole::Assistant => ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
+            text: message.text,
+        },
         MessageRole::User => ContentItem::InputText { text: message.text },
     };
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: match message.role {
             MessageRole::Assistant => "assistant".to_string(),
@@ -201,6 +213,7 @@ fn turn_complete_item(
     completed_at: Option<i64>,
 ) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+        root_turn_id: None,
         turn_id,
         last_agent_message: None,
         error: None,
@@ -251,6 +264,8 @@ mod tests {
                 text: EXTERNAL_SESSION_IMPORTED_MARKER.into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             }
         );
     }
@@ -283,6 +298,8 @@ mod tests {
                 text: EXTERNAL_SESSION_IMPORTED_MARKER.into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             })
         );
         let last_turn_complete = imported
@@ -325,7 +342,8 @@ mod tests {
             .filter(|item| {
                 matches!(
                     item,
-                    RolloutItem::ResponseItem(ResponseItem::Message { .. })
+                    RolloutItem::ResponseItem(response_item)
+                        if matches!(&response_item.item, ResponseItem::Message { .. })
                 )
             })
             .count();

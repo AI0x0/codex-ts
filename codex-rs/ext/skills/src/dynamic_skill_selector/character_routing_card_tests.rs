@@ -1,10 +1,11 @@
-use codex_core_skills::SkillLoadOutcome;
+use crate::SkillLoadOutcome;
 use codex_protocol::protocol::SkillScope;
 use codex_skills::SkillDependencies;
 use codex_skills::SkillInterface;
 use codex_skills::SkillMetadata;
 use codex_skills::SkillToolDependency;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 
 use crate::catalog::SkillAuthority;
@@ -34,7 +35,7 @@ fn host_interface_metadata_makes_unlisted_workflow_discoverable() {
         }),
         dependencies: None,
         policy: None,
-        path_to_skills_md: path,
+        path_to_skills_md: PathUri::from_abs_path(&path),
         scope: SkillScope::User,
         plugin_id: None,
         remote_plugin_id: None,
@@ -76,6 +77,7 @@ fn connector_dependencies_make_generic_skills_discoverable() {
             transport: None,
             command: None,
             url: None,
+            oauth_callback_port: None,
         }],
     };
     let documents = [

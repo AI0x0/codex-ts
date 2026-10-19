@@ -1,3 +1,6 @@
+#[path = "memory_readiness.rs"]
+mod readiness;
+
 use super::threads::ThreadFilterOptions;
 use super::threads::push_thread_filters;
 use super::*;
@@ -8,6 +11,8 @@ use crate::model::Stage1JobClaimOutcome;
 use crate::model::Stage1Output;
 use crate::model::Stage1StartupClaimParams;
 use crate::model::ThreadRow;
+use crate::sqlite::SqlitePoolWriteExt;
+use crate::sqlite::SqliteWriteQueryExt;
 use chrono::DateTime;
 use chrono::Duration;
 use sqlx::Executor;
@@ -61,7 +66,7 @@ impl MemoryStore {
         }
 
         let now = Utc::now().timestamp();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_immediate().await?;
         let mut updated_rows = 0;
 
         for thread_id in thread_ids {
@@ -177,6 +182,9 @@ SELECT
     threads.updated_at_ms AS updated_at,
     threads.recency_at_ms AS recency_at,
     threads.source,
+    threads.originator,
+    threads.creator_user_id,
+    threads.creator_account_id,
     threads.history_mode,
     threads.thread_source,
     threads.agent_path,
@@ -201,6 +209,15 @@ SELECT
         FROM thread_sections
         WHERE thread_sections.id = threads.thread_section_id
     ) AS section_name,
+    (
+        SELECT thread_sections.appearance
+        FROM thread_sections
+        WHERE thread_sections.id = threads.thread_section_id
+    ) AS section_appearance,
+    threads.section_position,
+    threads.section_entered_at_ms,
+    threads.project_id,
+    threads.daybreak_enabled,
     threads.git_sha,
     threads.git_branch,
     threads.git_origin_url
@@ -215,6 +232,7 @@ FROM threads
                 model_providers: None,
                 cwd_filters: None,
                 section: None,
+                project_id: None,
                 anchor: None,
                 sort_key: SortKey::UpdatedAt,
                 sort_direction: SortDirection::Desc,
@@ -283,7 +301,7 @@ FROM threads
     pub(super) async fn delete_thread_memory(&self, thread_id: ThreadId) -> anyhow::Result<()> {
         let now = Utc::now().timestamp();
         let thread_id = thread_id.to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_immediate().await?;
 
         let existing_output = sqlx::query(
             r#"
@@ -412,7 +430,7 @@ WHERE thread_id IN (
         )
         .bind(cutoff)
         .bind(limit as i64)
-        .execute(self.pool.as_ref())
+        .execute_with_busy_retry(self.pool.as_ref())
         .await?
         .rows_affected();
 
@@ -558,6 +576,9 @@ SELECT
     threads.updated_at_ms AS updated_at,
     threads.recency_at_ms AS recency_at,
     threads.source,
+    threads.originator,
+    threads.creator_user_id,
+    threads.creator_account_id,
     threads.history_mode,
     threads.thread_source,
     threads.agent_nickname,
@@ -582,6 +603,15 @@ SELECT
         FROM thread_sections
         WHERE thread_sections.id = threads.thread_section_id
     ) AS section_name,
+    (
+        SELECT thread_sections.appearance
+        FROM thread_sections
+        WHERE thread_sections.id = threads.thread_section_id
+    ) AS section_appearance,
+    threads.section_position,
+    threads.section_entered_at_ms,
+    threads.project_id,
+    threads.daybreak_enabled,
     threads.git_sha,
     threads.git_branch,
     threads.git_origin_url
@@ -624,7 +654,7 @@ WHERE id = ? AND memory_mode != 'polluted'
             "#,
         )
         .bind(thread_id.as_str())
-        .execute(self.state_pool.as_ref())
+        .execute_with_busy_retry(self.state_pool.as_ref())
         .await?
         .rows_affected();
 
@@ -666,7 +696,7 @@ WHERE id = ? AND memory_mode != 'polluted'
         let thread_id = thread_id.to_string();
         let worker_id = worker_id.to_string();
 
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.pool.begin_immediate().await?;
 
         let existing_output = sqlx::query(
             r#"
@@ -850,7 +880,7 @@ WHERE kind = ? AND job_key = ?
         let now = Utc::now().timestamp();
         let thread_id = thread_id.to_string();
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_immediate().await?;
         let rows_affected = sqlx::query(
             r#"
 UPDATE jobs
@@ -927,7 +957,7 @@ WHERE excluded.source_updated_at >= stage1_outputs.source_updated_at
         let now = Utc::now().timestamp();
         let thread_id = thread_id.to_string();
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_immediate().await?;
         let rows_affected = sqlx::query(
             r#"
 UPDATE jobs
@@ -1025,7 +1055,7 @@ WHERE kind = ? AND job_key = ?
         .bind(JOB_KIND_MEMORY_STAGE1)
         .bind(thread_id.as_str())
         .bind(ownership_token)
-        .execute(self.pool.as_ref())
+        .execute_with_busy_retry(self.pool.as_ref())
         .await?
         .rows_affected();
 
@@ -1040,7 +1070,10 @@ WHERE kind = ? AND job_key = ?
     /// Phase 2 does not use this watermark as a dirty check; git workspace diffing
     /// decides whether consolidation work exists after the lock is claimed.
     pub async fn enqueue_global_consolidation(&self, input_watermark: i64) -> anyhow::Result<()> {
-        enqueue_global_consolidation_with_executor(self.pool.as_ref(), input_watermark).await
+        crate::sqlite::retry_on_busy(|| {
+            enqueue_global_consolidation_with_executor(self.pool.as_ref(), input_watermark)
+        })
+        .await
     }
 
     /// Attempts to claim the global phase-2 consolidation lock.
@@ -1067,7 +1100,7 @@ WHERE kind = ? AND job_key = ?
         let ownership_token = Uuid::new_v4().to_string();
         let worker_id = worker_id.to_string();
 
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.pool.begin_immediate().await?;
 
         let existing_job = sqlx::query(
             r#"
@@ -1212,7 +1245,7 @@ WHERE kind = ? AND job_key = ?
         .bind(JOB_KIND_MEMORY_CONSOLIDATE_GLOBAL)
         .bind(MEMORY_CONSOLIDATION_JOB_KEY)
         .bind(ownership_token)
-        .execute(self.pool.as_ref())
+        .execute_with_busy_retry(self.pool.as_ref())
         .await?
         .rows_affected();
 
@@ -1235,7 +1268,7 @@ WHERE kind = ? AND job_key = ?
         completed_watermark: i64,
         selected_outputs: &[Stage1Output],
     ) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_immediate().await?;
         let rows_affected =
             mark_global_phase2_job_succeeded_row(&mut *tx, ownership_token, completed_watermark)
                 .await?;
@@ -1274,6 +1307,12 @@ WHERE thread_id = ? AND source_updated_at = ?
             .await?;
         }
 
+        sqlx::query(
+            "UPDATE consolidation_progress SET max_thread_count = MAX(max_thread_count, ?)",
+        )
+        .bind(i64::try_from(selected_outputs.len())?)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -1313,7 +1352,7 @@ WHERE kind = ? AND job_key = ?
         .bind(JOB_KIND_MEMORY_CONSOLIDATE_GLOBAL)
         .bind(MEMORY_CONSOLIDATION_JOB_KEY)
         .bind(ownership_token)
-        .execute(self.pool.as_ref())
+        .execute_with_busy_retry(self.pool.as_ref())
         .await?
         .rows_affected();
 
@@ -1355,7 +1394,7 @@ WHERE kind = ? AND job_key = ?
         .bind(JOB_KIND_MEMORY_CONSOLIDATE_GLOBAL)
         .bind(MEMORY_CONSOLIDATION_JOB_KEY)
         .bind(ownership_token)
-        .execute(self.pool.as_ref())
+        .execute_with_busy_retry(self.pool.as_ref())
         .await?
         .rows_affected();
 
@@ -1398,7 +1437,10 @@ WHERE kind = ? AND job_key = ?
 }
 
 pub(super) async fn clear_memory_data_in_pool(pool: &SqlitePool) -> anyhow::Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_immediate().await?;
+    sqlx::query("UPDATE consolidation_progress SET max_thread_count = 0")
+        .execute(&mut *tx)
+        .await?;
 
     sqlx::query(
         r#"

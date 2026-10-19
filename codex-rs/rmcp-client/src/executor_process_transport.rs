@@ -45,8 +45,6 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
-use crate::incoming_jsonrpc::deserialize_incoming_jsonrpc_message;
-
 static PROCESS_COUNTER: AtomicUsize = AtomicUsize::new(1);
 // Tool results can make valid MCP responses large, so keep the protocol
 // ceiling well above ordinary messages while still bounding hostile input.
@@ -407,20 +405,20 @@ impl ExecutorProcessTransport {
     }
 
     fn push_process_output(&mut self, chunk: ProcessOutputChunk) {
-        let bytes = chunk.chunk.into_inner();
+        let bytes = chunk.chunk.as_ref();
         match chunk.stream {
             // MCP stdio uses stdout as the protocol stream. PTY output is
             // accepted defensively because the executor process API has a
             // unified stream enum, but remote MCP starts with `tty=false`.
             ExecOutputStream::Stdout | ExecOutputStream::Pty => {
-                if let Err(error) = self.stdout.extend_from_slice(&bytes) {
+                if let Err(error) = self.stdout.extend_from_slice(bytes) {
                     self.close_for_oversized_line("stdout", error);
                 }
             }
             // Stderr is intentionally out-of-band. It should help debug server
             // startup failures without entering rmcp framing.
             ExecOutputStream::Stderr => {
-                if let Err(error) = self.push_stderr(&bytes) {
+                if let Err(error) = self.push_stderr(bytes) {
                     self.stdout.clear();
                     self.close_for_oversized_line("stderr", error);
                 }
@@ -452,7 +450,7 @@ impl ExecutorProcessTransport {
                 None => return None,
             };
             let line = Self::trim_trailing_carriage_return(line);
-            match deserialize_incoming_jsonrpc_message(&line) {
+            match serde_json::from_slice(&line) {
                 Ok(message) => return Some(message),
                 Err(error) => {
                     debug!(

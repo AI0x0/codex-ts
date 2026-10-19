@@ -30,10 +30,17 @@ pub struct HookStateToml {
     pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_hash: Option<String>,
+    /// Approved plugin contents; kept separate for declaration-only clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_content_hash: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HookEventsToml {
+    #[serde(rename = "PreModelRequest", default)]
+    pub pre_model_request: Vec<MatcherGroup>,
+    #[serde(rename = "PostModelRequest", default)]
+    pub post_model_request: Vec<MatcherGroup>,
     #[serde(rename = "PreToolUse", default)]
     pub pre_tool_use: Vec<MatcherGroup>,
     #[serde(rename = "PermissionRequest", default)]
@@ -56,11 +63,15 @@ pub struct HookEventsToml {
     pub subagent_stop: Vec<MatcherGroup>,
     #[serde(rename = "Stop", default)]
     pub stop: Vec<MatcherGroup>,
+    #[serde(rename = "Interrupt", default)]
+    pub interrupt: Vec<MatcherGroup>,
 }
 
 impl HookEventsToml {
     pub fn is_empty(&self) -> bool {
         let Self {
+            pre_model_request,
+            post_model_request,
             pre_tool_use,
             permission_request,
             post_tool_use,
@@ -72,8 +83,11 @@ impl HookEventsToml {
             subagent_start,
             subagent_stop,
             stop,
+            interrupt,
         } = self;
-        pre_tool_use.is_empty()
+        pre_model_request.is_empty()
+            && post_model_request.is_empty()
+            && pre_tool_use.is_empty()
             && permission_request.is_empty()
             && post_tool_use.is_empty()
             && pre_compact.is_empty()
@@ -84,10 +98,13 @@ impl HookEventsToml {
             && subagent_start.is_empty()
             && subagent_stop.is_empty()
             && stop.is_empty()
+            && interrupt.is_empty()
     }
 
     pub fn handler_count(&self) -> usize {
         let Self {
+            pre_model_request,
+            post_model_request,
             pre_tool_use,
             permission_request,
             post_tool_use,
@@ -99,8 +116,11 @@ impl HookEventsToml {
             subagent_start,
             subagent_stop,
             stop,
+            interrupt,
         } = self;
         [
+            pre_model_request,
+            post_model_request,
             pre_tool_use,
             permission_request,
             post_tool_use,
@@ -112,6 +132,7 @@ impl HookEventsToml {
             subagent_start,
             subagent_stop,
             stop,
+            interrupt,
         ]
         .into_iter()
         .flatten()
@@ -119,19 +140,29 @@ impl HookEventsToml {
         .sum()
     }
 
-    pub fn into_matcher_groups(self) -> [(HookEventName, Vec<MatcherGroup>); 11] {
+    pub fn into_matcher_groups(mut self) -> [(HookEventName, Vec<MatcherGroup>); 14] {
+        self.matcher_groups_mut()
+            .map(|(event, groups)| (event, std::mem::take(groups)))
+    }
+
+    pub fn matcher_groups_mut(&mut self) -> [(HookEventName, &mut Vec<MatcherGroup>); 14] {
+        use HookEventName as Event;
+
         [
-            (HookEventName::PreToolUse, self.pre_tool_use),
-            (HookEventName::PermissionRequest, self.permission_request),
-            (HookEventName::PostToolUse, self.post_tool_use),
-            (HookEventName::PreCompact, self.pre_compact),
-            (HookEventName::PostCompact, self.post_compact),
-            (HookEventName::SessionStart, self.session_start),
-            (HookEventName::SessionEnd, self.session_end),
-            (HookEventName::UserPromptSubmit, self.user_prompt_submit),
-            (HookEventName::SubagentStart, self.subagent_start),
-            (HookEventName::SubagentStop, self.subagent_stop),
-            (HookEventName::Stop, self.stop),
+            (Event::PreModelRequest, &mut self.pre_model_request),
+            (Event::PostModelRequest, &mut self.post_model_request),
+            (Event::PreToolUse, &mut self.pre_tool_use),
+            (Event::PermissionRequest, &mut self.permission_request),
+            (Event::PostToolUse, &mut self.post_tool_use),
+            (Event::PreCompact, &mut self.pre_compact),
+            (Event::PostCompact, &mut self.post_compact),
+            (Event::SessionStart, &mut self.session_start),
+            (Event::SessionEnd, &mut self.session_end),
+            (Event::UserPromptSubmit, &mut self.user_prompt_submit),
+            (Event::SubagentStart, &mut self.subagent_start),
+            (Event::SubagentStop, &mut self.subagent_stop),
+            (Event::Stop, &mut self.stop),
+            (Event::Interrupt, &mut self.interrupt),
         ]
     }
 }
@@ -169,10 +200,37 @@ pub enum HookHandlerConfig {
         )]
         additional_context_limit: Option<usize>,
     },
+    #[serde(rename = "mcp_tool")]
+    McpTool {
+        server: String,
+        tool: String,
+        #[serde(default, deserialize_with = "deserialize_mcp_tool_input")]
+        input: serde_json::Map<String, serde_json::Value>,
+        #[serde(default, rename = "timeout")]
+        timeout_sec: Option<u64>,
+        #[serde(default, rename = "statusMessage")]
+        status_message: Option<String>,
+    },
     #[serde(rename = "prompt")]
     Prompt {},
     #[serde(rename = "agent")]
     Agent {},
+}
+
+// Reject values such as null that cannot be represented in TOML for trust hashing.
+fn deserialize_mcp_tool_input<'de, D>(
+    deserializer: D,
+) -> Result<serde_json::Map<String, serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let input = serde_json::Map::deserialize(deserializer)?;
+    toml::Value::try_from(&input).map_err(|error| {
+        serde::de::Error::custom(format!(
+            "MCP hook input must be representable as TOML: {error}"
+        ))
+    })?;
+    Ok(input)
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,7 +238,7 @@ pub struct ManagedHooksRequirementsToml {
     pub managed_dir: Option<PathBuf>,
     pub windows_managed_dir: Option<PathBuf>,
     #[serde(flatten)]
-    pub hooks: HookEventsToml,
+    pub hooks: Box<HookEventsToml>,
 }
 
 impl ManagedHooksRequirementsToml {
