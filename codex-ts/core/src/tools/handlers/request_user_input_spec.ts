@@ -61,8 +61,73 @@ export function createRequestUserInputTool(): ToolSpec {
   };
 }
 
+/** A value the model sent as text. Blank counts as missing, as in do-tv's ask-shape guard. */
+function isText(value: unknown): value is string {
+  return typeof value === "string" && value.trim() !== "";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 /**
- * Normalise args from the model: ensure options exist and set isOther = true.
+ * Every shape problem in the model's questions, named by path; [] when the
+ * shape is fine. The rules match do-tv's askShapeProblems
+ * (packages/web/app/(frontend)/features/agent/ask-shape.ts): keep them in sync.
+ */
+function requestUserInputProblems(questions: unknown[]): string[] {
+  const problems: string[] = [];
+  for (const [qi, raw] of questions.entries()) {
+    const at = `questions[${qi}]`;
+    if (!isRecord(raw)) {
+      problems.push(`${at} must be an object`);
+      continue;
+    }
+    if (!isText(raw.id)) {
+      problems.push(`${at}.id must be a non-empty string`);
+    }
+    if (!isText(raw.question)) {
+      problems.push(`${at}.question must be a non-empty string`);
+    }
+    if (raw.header !== undefined && typeof raw.header !== "string") {
+      problems.push(`${at}.header must be a string`);
+    }
+    if (!Array.isArray(raw.options) || raw.options.length === 0) {
+      problems.push(`${at}.options must be a non-empty array`);
+      continue;
+    }
+    for (const [oi, rawOption] of raw.options.entries()) {
+      const optionAt = `${at}.options[${oi}]`;
+      if (!isRecord(rawOption)) {
+        problems.push(`${optionAt} must be an object`);
+        continue;
+      }
+      if (!isText(rawOption.label)) {
+        problems.push(`${optionAt}.label must be a non-empty string`);
+      }
+      if (
+        rawOption.description !== undefined &&
+        typeof rawOption.description !== "string"
+      ) {
+        problems.push(`${optionAt}.description must be a string`);
+      }
+    }
+  }
+  return problems;
+}
+
+/**
+ * The tool error for a call the model has to redo. The card is not shown, so
+ * nothing is emitted and the turn does not suspend.
+ */
+function requestUserInputRetryError(problems: string[]): { error: string } {
+  return {
+    error: `request_user_input was NOT shown to the user: ${problems.join("; ")}. Call request_user_input again with corrected arguments.`,
+  };
+}
+
+/**
+ * Normalise args from the model: reject a malformed shape, set isOther = true.
  * mirrors normalize_request_user_input_tool_args (request_user_input_spec.rs:104).
  */
 export function normalizeRequestUserInputArgs(args: {
@@ -84,17 +149,13 @@ export function normalizeRequestUserInputArgs(args: {
   // guard before iterating so we return a tool error instead of throwing
   // "undefined is not an object (evaluating 'args.questions')".
   if (!Array.isArray(args.questions) || args.questions.length === 0) {
-    return {
-      error: "request_user_input requires a non-empty `questions` array",
-    };
+    return requestUserInputRetryError(["questions must be a non-empty array"]);
   }
-  for (const q of args.questions) {
-    if (!q.options || q.options.length === 0) {
-      return {
-        error:
-          "request_user_input requires non-empty options for every question",
-      };
-    }
+  // Under strict:false nothing else checks the shape, and a card the client
+  // cannot draw breaks the whole turn; hand the call back to the model instead.
+  const problems = requestUserInputProblems(args.questions);
+  if (problems.length > 0) {
+    return requestUserInputRetryError(problems);
   }
   return {
     questions: args.questions.map((q) => ({

@@ -218,7 +218,81 @@ describe("request_user_input missing options rejects", () => {
     );
     expect(toolOutput).toBeDefined();
     const parsed = JSON.parse(toolOutput!.output ?? "{}") as { error: string };
-    expect(parsed.error).toMatch(/non-empty options/);
+    expect(parsed.error).toMatch(
+      /questions\[0\]\.options must be a non-empty array/,
+    );
+  });
+});
+
+describe("request_user_input malformed question is bounced back, not shown", () => {
+  it("returns an error naming the bad paths and never emits RequestUserInput", async () => {
+    const callId = "call-rui-shape";
+    const fetchMock = vi.fn();
+    const capturedBodies: unknown[] = [];
+
+    fetchMock.mockImplementation(async (_url: string, init: RequestInit) => {
+      capturedBodies.push(JSON.parse(init.body as string));
+      const idx = capturedBodies.length;
+      if (idx === 1) {
+        return makeSseResponse(
+          sseFlat([
+            evResponseCreated("resp-1"),
+            evFunctionCall(callId, "request_user_input", {
+              questions: [
+                {
+                  id: "confirm_path",
+                  header: "Confirm",
+                  // The question text ended up in an option, and that option has no label.
+                  options: [
+                    { label: "Yes (Recommended)", description: "Continue." },
+                    { description: "Proceed with deployment?" },
+                  ],
+                },
+              ],
+            }),
+            evCompleted("resp-1"),
+          ]),
+        );
+      }
+      return makeSseResponse(
+        sseFlat([
+          evResponseCreated("resp-2"),
+          evAssistantMessage("retrying"),
+          evCompleted("resp-2"),
+        ]),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const codex = new CodexThread({ apiKey: "test", model: "gpt-4o" });
+    await codex.submit({
+      type: "UserInput",
+      items: [{ type: "text", text: "question" }],
+    });
+
+    // Collect everything up to TurnComplete; a suspended turn would never get there.
+    const seen: EventMsg[] = [];
+    await waitForEvent(codex, (msg) => {
+      seen.push(msg);
+      return msg.type === "TurnComplete";
+    });
+    expect(seen.some((msg) => msg.type === "RequestUserInput")).toBe(false);
+
+    const secondBody = capturedBodies[1] as {
+      input: { type?: string; call_id?: string; output?: string }[];
+    };
+    const toolOutput = secondBody.input.find(
+      (i) => i.type === "function_call_output" && i.call_id === callId,
+    );
+    expect(toolOutput).toBeDefined();
+    const parsed = JSON.parse(toolOutput!.output ?? "{}") as { error: string };
+    expect(parsed.error).toContain(
+      "questions[0].question must be a non-empty string",
+    );
+    expect(parsed.error).toContain(
+      "questions[0].options[1].label must be a non-empty string",
+    );
+    expect(parsed.error).toContain("Call request_user_input again");
   });
 });
 
@@ -278,6 +352,105 @@ describe("normalizeRequestUserInputArgs guards a malformed questions field", () 
     if ("questions" in result) {
       expect("autoResolutionMs" in result).toBe(false);
     }
+  });
+});
+
+describe("normalizeRequestUserInputArgs checks each question's shape", () => {
+  it("names the missing question text and the option with no label", () => {
+    const result = normalizeRequestUserInputArgs({
+      questions: [
+        {
+          id: "confirm_path",
+          header: "Confirm",
+          options: [
+            { label: "Yes (Recommended)", description: "Continue." },
+            { description: "Proceed with deployment?" },
+          ],
+        },
+      ] as never,
+    });
+    expect(result).toEqual({
+      error: expect.stringContaining(
+        "questions[0].question must be a non-empty string; questions[0].options[1].label must be a non-empty string",
+      ),
+    });
+  });
+
+  it("treats blank text as missing", () => {
+    const result = normalizeRequestUserInputArgs({
+      questions: [
+        {
+          id: " ",
+          question: "Pick?",
+          options: [{ label: "  ", description: "a" }],
+        },
+      ] as never,
+    });
+    expect(result).toEqual({
+      error: expect.stringContaining(
+        "questions[0].id must be a non-empty string; questions[0].options[0].label must be a non-empty string",
+      ),
+    });
+  });
+
+  it("names a question or option that is not an object, without throwing", () => {
+    expect(
+      normalizeRequestUserInputArgs({ questions: [null] } as never),
+    ).toEqual({
+      error: expect.stringContaining("questions[0] must be an object"),
+    });
+    expect(
+      normalizeRequestUserInputArgs({
+        questions: [{ id: "q1", question: "Pick?", options: ["A"] }] as never,
+      }),
+    ).toEqual({
+      error: expect.stringContaining(
+        "questions[0].options[0] must be an object",
+      ),
+    });
+  });
+
+  it("rejects a header or description that is not a string", () => {
+    const result = normalizeRequestUserInputArgs({
+      questions: [
+        {
+          id: "q1",
+          header: 3,
+          question: "Pick?",
+          options: [{ label: "A", description: null }],
+        },
+      ] as never,
+    });
+    expect(result).toEqual({
+      error: expect.stringContaining(
+        "questions[0].header must be a string; questions[0].options[0].description must be a string",
+      ),
+    });
+  });
+
+  it("accepts a question that leaves out header and description", () => {
+    const result = normalizeRequestUserInputArgs({
+      questions: [
+        { id: "q1", question: "Pick?", options: [{ label: "A" }] },
+      ] as never,
+    });
+    expect(result).toEqual({
+      questions: [
+        {
+          id: "q1",
+          question: "Pick?",
+          options: [{ label: "A" }],
+          isOther: true,
+          isSecret: false,
+        },
+      ],
+    });
+  });
+
+  it("names questions when it is missing", () => {
+    expect(normalizeRequestUserInputArgs({} as never)).toEqual({
+      error: expect.stringContaining("questions must be a non-empty array"),
+    });
   });
 });
 
